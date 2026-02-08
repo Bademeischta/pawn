@@ -1,0 +1,18 @@
+# DistillZero Dataset Generator Requirements
+# Python 3.8+
+
+# Core dependencies
+chess>=1.10.0          # Python chess library
+numpy>=1.24.0          # Numerical operations
+h5py>=3.8.0            # HDF5 file format
+tqdm>=4.65.0           # Progress bars
+scipy>=1.10.0          # For entropy calculations in visualization
+
+# Optional but recommended
+python-chess>=1.999    # Latest chess library features
+
+# System requirements:
+# - Stockfish binary (download from https://stockfishchess.org/download/)
+# - Multi-core CPU (recommended: 8+ cores for parallel evaluation)
+# - RAM: 4GB minimum, 16GB recommended for large datasets
+# - Disk space: ~1GB per 1M positions (compressed HDF5)
