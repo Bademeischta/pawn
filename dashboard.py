@@ -1,0 +1,610 @@
+"""
+Archimedes Chess AI - Interactive Dashboard
+Streamlit-based dashboard with live metrics, visualization, and play vs AI.
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+import sqlite3
+import chess
+import chess.svg
+import torch
+import time
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+import base64
+from io import BytesIO
+
+# Import project modules
+from model import ArchimedesGNN, ChessBoardEncoder
+from mcts import MCTS
+from metrics import MetricsLogger
+
+
+# Page configuration
+st.set_page_config(
+    page_title="Archimedes Chess AI Dashboard",
+    page_icon="♟️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+class DashboardData:
+    """Handles data loading from metrics database."""
+    
+    def __init__(self, db_path: str = "training_logs.db"):
+        self.db_path = db_path
+    
+    def get_training_metrics(self, limit: int = 1000) -> pd.DataFrame:
+        """Load training metrics."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM training_metrics ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def get_mcts_metrics(self, limit: int = 1000) -> pd.DataFrame:
+        """Load MCTS metrics."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM mcts_metrics ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def get_chess_metrics(self, limit: int = 1000) -> pd.DataFrame:
+        """Load chess-specific metrics."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM chess_metrics ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def get_hardware_metrics(self, limit: int = 1000) -> pd.DataFrame:
+        """Load hardware metrics."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM hardware_metrics ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def get_games(self, limit: int = 100) -> pd.DataFrame:
+        """Load game records."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM games ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def get_position_analysis(self, limit: int = 100) -> pd.DataFrame:
+        """Load position analysis data."""
+        conn = sqlite3.connect(self.db_path)
+        query = f"SELECT * FROM position_analysis ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+
+
+@st.cache_resource
+def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
+    """Load the trained model."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = ArchimedesGNN()
+    encoder = ChessBoardEncoder()
+    
+    if Path(checkpoint_path).exists():
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        model.eval()
+        return model, encoder, device
+    else:
+        st.warning(f"Checkpoint not found: {checkpoint_path}")
+        return None, None, device
+
+
+def render_board_svg(board: chess.Board, size: int = 400) -> str:
+    """Render chess board as SVG."""
+    svg = chess.svg.board(board, size=size)
+    return svg
+
+
+def plot_training_loss(df: pd.DataFrame):
+    """Plot training loss over time."""
+    if df.empty:
+        st.info("No training data available yet")
+        return
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Total Loss", "Policy Loss", "Value Loss", "Learning Rate"),
+        vertical_spacing=0.12
+    )
+    
+    # Total loss
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['loss_total'], mode='lines', name='Total Loss',
+                  line=dict(color='#FF6B6B', width=2)),
+        row=1, col=1
+    )
+    
+    # Policy loss
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['loss_policy'], mode='lines', name='Policy Loss',
+                  line=dict(color='#4ECDC4', width=2)),
+        row=1, col=2
+    )
+    
+    # Value loss
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['loss_value'], mode='lines', name='Value Loss',
+                  line=dict(color='#95E1D3', width=2)),
+        row=2, col=1
+    )
+    
+    # Learning rate
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['learning_rate'], mode='lines', name='Learning Rate',
+                  line=dict(color='#F38181', width=2)),
+        row=2, col=2
+    )
+    
+    fig.update_xaxes(title_text="Epoch")
+    fig.update_yaxes(title_text="Loss", row=1, col=1)
+    fig.update_yaxes(title_text="Loss", row=1, col=2)
+    fig.update_yaxes(title_text="Loss", row=2, col=1)
+    fig.update_yaxes(title_text="Rate", row=2, col=2)
+    
+    fig.update_layout(height=600, showlegend=False, template="plotly_dark")
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_accuracy(df: pd.DataFrame):
+    """Plot accuracy metrics."""
+    if df.empty or 'accuracy_top1' not in df.columns:
+        st.info("No accuracy data available yet")
+        return
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df['epoch'], y=df['accuracy_top1'] * 100,
+        mode='lines+markers', name='Top-1 Accuracy',
+        line=dict(color='#00D9FF', width=3)
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=df['epoch'], y=df['accuracy_top5'] * 100,
+        mode='lines+markers', name='Top-5 Accuracy',
+        line=dict(color='#7B68EE', width=3)
+    ))
+    
+    fig.update_layout(
+        title="Move Prediction Accuracy",
+        xaxis_title="Epoch",
+        yaxis_title="Accuracy (%)",
+        template="plotly_dark",
+        height=400
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_mcts_performance(df: pd.DataFrame):
+    """Plot MCTS performance metrics."""
+    if df.empty:
+        st.info("No MCTS data available yet")
+        return
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Search Depth", "Nodes per Second", "Cache Hit Rate", "Q-Value Distribution"),
+        vertical_spacing=0.12
+    )
+    
+    # Search depth
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['avg_search_depth'], mode='lines', name='Avg Depth',
+                  line=dict(color='#FFD93D', width=2)),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['max_search_depth'], mode='lines', name='Max Depth',
+                  line=dict(color='#FF6B9D', width=2)),
+        row=1, col=1
+    )
+    
+    # Nodes per second
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['nodes_per_second'], mode='lines', name='NPS',
+                  line=dict(color='#6BCB77', width=2)),
+        row=1, col=2
+    )
+    
+    # Cache hit rate
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['cache_hit_rate'] * 100, mode='lines', name='Hit Rate',
+                  line=dict(color='#4D96FF', width=2)),
+        row=2, col=1
+    )
+    
+    # Q-value distribution
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['q_value_mean'], mode='lines', name='Q Mean',
+                  line=dict(color='#C780FA', width=2)),
+        row=2, col=2
+    )
+    
+    fig.update_xaxes(title_text="Epoch")
+    fig.update_layout(height=600, showlegend=True, template="plotly_dark")
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_chess_performance(df: pd.DataFrame):
+    """Plot chess-specific performance."""
+    if df.empty:
+        st.info("No chess performance data available yet")
+        return
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Elo Rating", "Win/Loss/Draw Rates", "Game Length", "Performance by Color"),
+        specs=[[{"type": "scatter"}, {"type": "bar"}],
+               [{"type": "scatter"}, {"type": "bar"}]],
+        vertical_spacing=0.15
+    )
+    
+    # Elo rating
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['elo_estimate'], mode='lines+markers',
+                  name='Elo', line=dict(color='#FFD700', width=3)),
+        row=1, col=1
+    )
+    
+    # Win/Loss/Draw rates (latest)
+    if not df.empty:
+        latest = df.iloc[0]
+        fig.add_trace(
+            go.Bar(x=['Win', 'Draw', 'Loss'],
+                  y=[latest['win_rate']*100, latest['draw_rate']*100, latest['loss_rate']*100],
+                  marker_color=['#00D9FF', '#FFD93D', '#FF6B6B']),
+            row=1, col=2
+        )
+    
+    # Game length
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['avg_game_length'], mode='lines+markers',
+                  name='Avg Length', line=dict(color='#95E1D3', width=2)),
+        row=2, col=1
+    )
+    
+    # Performance by color (latest)
+    if not df.empty:
+        latest = df.iloc[0]
+        fig.add_trace(
+            go.Bar(x=['White', 'Black'],
+                  y=[latest['white_performance']*100, latest['black_performance']*100],
+                  marker_color=['#FFFFFF', '#333333']),
+            row=2, col=2
+        )
+    
+    fig.update_xaxes(title_text="Epoch", row=1, col=1)
+    fig.update_xaxes(title_text="Epoch", row=2, col=1)
+    fig.update_yaxes(title_text="Elo", row=1, col=1)
+    fig.update_yaxes(title_text="Rate (%)", row=1, col=2)
+    fig.update_yaxes(title_text="Moves", row=2, col=1)
+    fig.update_yaxes(title_text="Win Rate (%)", row=2, col=2)
+    
+    fig.update_layout(height=700, showlegend=False, template="plotly_dark")
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_hardware_usage(df: pd.DataFrame):
+    """Plot hardware utilization."""
+    if df.empty:
+        st.info("No hardware data available yet")
+        return
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("GPU Utilization", "GPU Memory", "CPU & RAM", "GPU Temperature"),
+        vertical_spacing=0.12
+    )
+    
+    # GPU utilization
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['gpu_utilization'], mode='lines',
+                  name='GPU %', line=dict(color='#00FF00', width=2), fill='tozeroy'),
+        row=1, col=1
+    )
+    
+    # GPU memory
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['gpu_memory_used'], mode='lines',
+                  name='Used', line=dict(color='#FF6B6B', width=2)),
+        row=1, col=2
+    )
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['gpu_memory_total'], mode='lines',
+                  name='Total', line=dict(color='#4ECDC4', width=2, dash='dash')),
+        row=1, col=2
+    )
+    
+    # CPU & RAM
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['cpu_percent'], mode='lines',
+                  name='CPU %', line=dict(color='#FFD93D', width=2)),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['ram_used'], mode='lines',
+                  name='RAM (GB)', line=dict(color='#C780FA', width=2)),
+        row=2, col=1
+    )
+    
+    # GPU temperature
+    fig.add_trace(
+        go.Scatter(x=df['epoch'], y=df['gpu_temperature'], mode='lines',
+                  name='Temp °C', line=dict(color='#FF6B9D', width=2)),
+        row=2, col=2
+    )
+    
+    fig.update_xaxes(title_text="Epoch")
+    fig.update_layout(height=600, showlegend=True, template="plotly_dark")
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def play_vs_ai_tab(model, encoder, device):
+    """Interactive play vs AI interface."""
+    st.header("♟️ Play vs Archimedes")
+    
+    # Initialize game state
+    if 'board' not in st.session_state:
+        st.session_state.board = chess.Board()
+        st.session_state.move_history = []
+    
+    board = st.session_state.board
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # Render board
+        svg = render_board_svg(board, size=500)
+        st.image(svg, use_column_width=True)
+    
+    with col2:
+        st.subheader("Game Info")
+        st.write(f"**Turn:** {'White' if board.turn else 'Black'}")
+        st.write(f"**Moves:** {board.fullmove_number}")
+        st.write(f"**FEN:** `{board.fen()}`")
+        
+        if board.is_game_over():
+            st.success(f"**Game Over!** Result: {board.result()}")
+        
+        # Move input
+        st.subheader("Your Move")
+        move_input = st.text_input("Enter move (e.g., e2e4):", key="move_input")
+        
+        col_a, col_b, col_c = st.columns(3)
+        
+        with col_a:
+            if st.button("Make Move"):
+                try:
+                    move = chess.Move.from_uci(move_input)
+                    if move in board.legal_moves:
+                        board.push(move)
+                        st.session_state.move_history.append(move_input)
+                        st.rerun()
+                    else:
+                        st.error("Illegal move!")
+                except:
+                    st.error("Invalid move format!")
+        
+        with col_b:
+            if st.button("AI Move"):
+                if model and not board.is_game_over():
+                    with st.spinner("AI thinking..."):
+                        mcts = MCTS(model, encoder, num_simulations=400)
+                        ai_move, stats = mcts.search(board, add_noise=False)
+                        board.push(ai_move)
+                        st.session_state.move_history.append(ai_move.uci())
+                        st.rerun()
+        
+        with col_c:
+            if st.button("Reset"):
+                st.session_state.board = chess.Board()
+                st.session_state.move_history = []
+                st.rerun()
+        
+        # Move history
+        if st.session_state.move_history:
+            st.subheader("Move History")
+            st.write(" ".join(st.session_state.move_history))
+
+
+def position_analysis_tab(model, encoder, device):
+    """Position analysis and visualization."""
+    st.header("🔍 Position Analysis")
+    
+    fen_input = st.text_input("Enter FEN:", value=chess.Board().fen())
+    
+    try:
+        board = chess.Board(fen_input)
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            svg = render_board_svg(board, size=500)
+            st.image(svg, use_column_width=True)
+        
+        with col2:
+            if model and st.button("Analyze Position"):
+                with st.spinner("Analyzing..."):
+                    # Get model evaluation
+                    data = encoder.board_to_graph(board).to(device)
+                    with torch.no_grad():
+                        policy_logits, value, aux = model(data)
+                    
+                    st.metric("Position Evaluation", f"{value.item():.3f}")
+                    
+                    # Get top moves
+                    mcts = MCTS(model, encoder, num_simulations=200)
+                    best_move, stats = mcts.search(board, add_noise=False)
+                    
+                    st.subheader("Top Moves")
+                    for move_data in stats.get('top_moves', [])[:5]:
+                        st.write(f"**{move_data['move']}**: "
+                                f"Visits={move_data['visits']}, "
+                                f"Q={move_data['q_value']:.3f}")
+    
+    except Exception as e:
+        st.error(f"Invalid FEN: {e}")
+
+
+def main():
+    """Main dashboard application."""
+    
+    # Title
+    st.title("♟️ Archimedes Chess AI Dashboard")
+    st.markdown("---")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        db_path = st.text_input("Database Path", value="training_logs.db")
+        checkpoint_path = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
+        
+        auto_refresh = st.checkbox("Auto Refresh", value=False)
+        if auto_refresh:
+            refresh_interval = st.slider("Refresh Interval (s)", 5, 60, 10)
+        
+        st.markdown("---")
+        st.header("📊 Quick Stats")
+        
+        # Load data
+        data_loader = DashboardData(db_path)
+        
+        try:
+            train_df = data_loader.get_training_metrics(limit=1)
+            if not train_df.empty:
+                latest = train_df.iloc[0]
+                st.metric("Current Epoch", int(latest['epoch']))
+                st.metric("Latest Loss", f"{latest['loss_total']:.4f}")
+                st.metric("Top-1 Accuracy", f"{latest.get('accuracy_top1', 0)*100:.1f}%")
+        except:
+            st.info("No training data yet")
+    
+    # Load model
+    model, encoder, device = load_model(checkpoint_path)
+    
+    # Main tabs
+    tabs = st.tabs([
+        "📈 Training", "🎯 MCTS", "♟️ Chess Performance",
+        "💻 Hardware", "🎮 Play vs AI", "🔍 Analysis", "📥 Downloads"
+    ])
+    
+    # Training tab
+    with tabs[0]:
+        st.header("Training Metrics")
+        try:
+            train_df = data_loader.get_training_metrics(limit=1000)
+            train_df = train_df.sort_values('epoch')
+            
+            plot_training_loss(train_df)
+            plot_accuracy(train_df)
+            
+            # Recent metrics table
+            st.subheader("Recent Metrics")
+            if not train_df.empty:
+                display_df = train_df[['epoch', 'loss_total', 'loss_policy', 'loss_value', 
+                                       'accuracy_top1', 'learning_rate']].head(10)
+                st.dataframe(display_df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error loading training data: {e}")
+    
+    # MCTS tab
+    with tabs[1]:
+        st.header("MCTS Performance")
+        try:
+            mcts_df = data_loader.get_mcts_metrics(limit=1000)
+            mcts_df = mcts_df.sort_values('epoch')
+            plot_mcts_performance(mcts_df)
+        except Exception as e:
+            st.error(f"Error loading MCTS data: {e}")
+    
+    # Chess performance tab
+    with tabs[2]:
+        st.header("Chess Performance")
+        try:
+            chess_df = data_loader.get_chess_metrics(limit=1000)
+            chess_df = chess_df.sort_values('epoch')
+            plot_chess_performance(chess_df)
+        except Exception as e:
+            st.error(f"Error loading chess data: {e}")
+    
+    # Hardware tab
+    with tabs[3]:
+        st.header("Hardware Utilization")
+        try:
+            hw_df = data_loader.get_hardware_metrics(limit=1000)
+            hw_df = hw_df.sort_values('epoch')
+            plot_hardware_usage(hw_df)
+        except Exception as e:
+            st.error(f"Error loading hardware data: {e}")
+    
+    # Play vs AI tab
+    with tabs[4]:
+        play_vs_ai_tab(model, encoder, device)
+    
+    # Analysis tab
+    with tabs[5]:
+        position_analysis_tab(model, encoder, device)
+    
+    # Downloads tab
+    with tabs[6]:
+        st.header("📥 Downloads")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Model Checkpoints")
+            checkpoint_dir = Path("checkpoints")
+            if checkpoint_dir.exists():
+                checkpoints = list(checkpoint_dir.glob("*.pt"))
+                for cp in checkpoints:
+                    st.download_button(
+                        label=f"📦 {cp.name}",
+                        data=open(cp, "rb").read(),
+                        file_name=cp.name,
+                        mime="application/octet-stream"
+                    )
+        
+        with col2:
+            st.subheader("Game Records")
+            if st.button("Export Games to PGN"):
+                try:
+                    logger = MetricsLogger(db_path)
+                    logger.export_games_pgn("exported_games.pgn", limit=100)
+                    st.success("Games exported to exported_games.pgn")
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+    
+    # Auto refresh
+    if auto_refresh:
+        time.sleep(refresh_interval)
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()
