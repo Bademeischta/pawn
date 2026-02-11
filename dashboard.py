@@ -21,7 +21,7 @@ import base64
 from io import BytesIO
 
 # Import project modules
-from model import ArchimedesGNN, ChessBoardEncoder
+from model import ChessResNet, AlphaZeroEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
 
@@ -87,8 +87,8 @@ def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     try:
-        model = ArchimedesGNN()
-        encoder = ChessBoardEncoder()
+        model = ChessResNet()
+        encoder = AlphaZeroEncoder()
 
         if Path(checkpoint_path).exists():
             # Use weights_only=True for security if using newer torch versions,
@@ -466,9 +466,9 @@ def position_analysis_tab(model, encoder, device):
             if model and st.button("Analyze Position"):
                 with st.spinner("Analyzing..."):
                     # Get model evaluation
-                    data = encoder.board_to_graph(board).to(device)
+                    tensor = encoder.board_to_tensor(board).unsqueeze(0).to(device)
                     with torch.no_grad():
-                        policy_logits, value, aux = model(data)
+                        policy_logits, value = model(tensor)
                     
                     st.metric("Position Evaluation", f"{value.item():.3f}")
                     

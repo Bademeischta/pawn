@@ -25,17 +25,19 @@ class MCTSNode:
     visit_count: int = 0
     total_value: float = 0.0
     prior_prob: float = 0.0
+    virtual_loss: int = 0
     
     # Cached values
     is_terminal: bool = False
     terminal_value: Optional[float] = None
     legal_moves: List[chess.Move] = field(default_factory=list)
     
-    def q_value(self) -> float:
-        """Average value of this node."""
-        if self.visit_count == 0:
+    def q_value(self, use_virtual_loss: bool = False) -> float:
+        """Average value of this node, optionally including virtual loss."""
+        visits = self.visit_count + (self.virtual_loss if use_virtual_loss else 0)
+        if visits == 0:
             return 0.0
-        return self.total_value / self.visit_count
+        return self.total_value / visits
     
     def uct_value(self, parent_visits: int, c_puct: float = 1.4) -> float:
         """
@@ -215,23 +217,23 @@ class MCTS:
 
         # Optimization: Cache model device to avoid repeated discovery
         self.device = next(model.parameters()).device
+
+        # Optionally use TorchScript for faster inference
+        self.use_traced_model = False
+        if hasattr(model, 'traced_model') and model.traced_model is not None:
+            self.traced_model = model.traced_model
+            self.use_traced_model = True
     
-    def search(self, board: chess.Board, add_noise: bool = True) -> Tuple[chess.Move, Dict]:
+    def search(self, board: chess.Board, add_noise: bool = True, batch_size: int = 8) -> Tuple[chess.Move, Dict]:
         """
         Perform MCTS search and return best move with statistics.
-        
-        Returns:
-            best_move: Selected move
-            stats: Dictionary with search statistics
         """
         self.metrics.reset()
         start_time = time.time()
         
-        # Get root node
         root_hash = self.transposition_table.get_hash(board) if self.transposition_table else str(board.fen())
         root = self._get_or_create_node(board, root_hash, None, None)
         
-        # Add Dirichlet noise to root for exploration
         if add_noise and root.legal_moves:
             noise = np.random.dirichlet([self.dirichlet_alpha] * len(root.legal_moves))
             for move, n in zip(root.legal_moves, noise):
@@ -240,15 +242,10 @@ class MCTS:
                     child.prior_prob = (1 - self.dirichlet_epsilon) * child.prior_prob + \
                                       self.dirichlet_epsilon * n
         
-        # Run simulations
-        for sim in range(self.num_simulations):
-            # Optimization: Use push/pop instead of copying the whole board
-            # except for the root to ensure we don't accidentally corrupt the main board
-            # (though _simulate should pop everything back, copying once per simulation is safer
-            # than once per node but less safe than once per search).
-            # We'll stick to one copy per simulation for safety in case of crashes/interrupts.
-            board_copy = board.copy()
-            self._simulate(board_copy, root, depth=0)
+        # Run simulations in batches
+        num_batches = max(1, self.num_simulations // batch_size)
+        for _ in range(num_batches):
+            self._simulate_batch(board, root, batch_size)
         
         self.metrics.search_time = time.time() - start_time
         
@@ -267,38 +264,109 @@ class MCTS:
         
         return best_move, stats
     
-    def _simulate(self, board: chess.Board, node: MCTSNode, depth: int):
-        """Run one MCTS simulation."""
-        # Terminal node check
-        if node.is_terminal:
-            return node.terminal_value
+    def _simulate_batch(self, board: chess.Board, root: MCTSNode, batch_size: int):
+        """Perform multiple simulations in parallel and evaluate as a batch."""
+        paths = []
+        leaf_boards = []
+        leaf_nodes = []
+
+        # 1. Selection Phase for the whole batch
+        for _ in range(batch_size):
+            path = []
+            current_board = board.copy()
+            current_node = root
+            depth = 0
+
+            # Navigate until we hit a leaf or terminal
+            while current_node.visit_count > 0 and not current_node.is_terminal:
+                move, next_node = self._select_child(current_node, use_virtual_loss=True)
+                if next_node is None: break
+
+                # Apply virtual loss to encourage exploration within the batch
+                current_node.virtual_loss += 1
+                path.append(current_node)
+
+                current_board.push(move)
+                current_node = next_node
+                depth += 1
+
+            paths.append(path)
+            leaf_boards.append(current_board)
+            leaf_nodes.append(current_node)
+            self.metrics.record_node(depth, current_node.q_value(), current_node.visit_count, len(current_node.children))
+
+        # 2. Batch Evaluation
+        # Filter out terminal nodes (they don't need evaluation)
+        eval_indices = [i for i, node in enumerate(leaf_nodes) if not node.is_terminal]
         
-        # Leaf node - expand and evaluate
-        if node.visit_count == 0:
-            value = self._expand_and_evaluate(board, node)
-            self.metrics.record_node(depth, value, 1, len(node.children))
-            return value
-        
-        # Select child using PUCT
-        move, child = self._select_child(node)
-        
-        if child is None:
-            # No legal moves (shouldn't happen)
-            return 0.0
-        
-        # Make move
-        board.push(move)
-        
-        # Recurse
-        value = -self._simulate(board, child, depth + 1)
-        
-        # Backpropagate
-        node.visit_count += 1
-        node.total_value += value
-        
-        self.metrics.record_node(depth, node.q_value(), node.visit_count, len(node.children))
-        
-        return value
+        if eval_indices:
+            eval_boards = [leaf_boards[i] for i in eval_indices]
+            eval_tensors = [self.encoder.board_to_tensor(b) for b in eval_boards]
+            batch_tensor = torch.stack(eval_tensors).to(self.device)
+
+            self.model.eval()
+            with torch.no_grad():
+                if self.use_traced_model:
+                    batch_logits, batch_values = self.traced_model(batch_tensor)
+                else:
+                    batch_logits, batch_values = self.model(batch_tensor)
+                batch_probs = torch.softmax(batch_logits, dim=1).cpu().numpy()
+                batch_values = batch_values.squeeze(-1).cpu().numpy()
+
+            from model import MoveEncoder
+            move_encoder = MoveEncoder()
+
+            # Process each evaluated leaf
+            for i, idx in enumerate(eval_indices):
+                node = leaf_nodes[idx]
+                board_at_leaf = leaf_boards[idx]
+                value = batch_values[i]
+                probs = batch_probs[i]
+
+                # Expand leaf
+                legal_moves = list(board_at_leaf.legal_moves)
+                node.legal_moves = legal_moves
+
+                if not legal_moves:
+                    node.is_terminal = True
+                    node.terminal_value = 0.0
+                else:
+                    for move in legal_moves:
+                        move_idx = move_encoder.move_to_index(move)
+                        prior = probs[move_idx] if move_idx != -1 else 0.0
+
+                        board_at_leaf.push(move)
+                        child_hash = self.transposition_table.get_hash(board_at_leaf) if self.transposition_table else str(board_at_leaf.fen())
+                        child = self._get_or_create_node(board_at_leaf, child_hash, node, move)
+                        child.prior_prob = prior
+                        node.children[move] = child
+                        board_at_leaf.pop()
+
+                    # Normalize priors
+                    total_prior = sum(child.prior_prob for child in node.children.values())
+                    if total_prior > 0:
+                        for child in node.children.values():
+                            child.prior_prob /= total_prior
+
+                    node.visit_count = 1
+                    node.total_value = value
+
+                self.metrics.positions_evaluated += 1
+
+        # 3. Backpropagation
+        for i, path in enumerate(paths):
+            leaf_node = leaf_nodes[i]
+            # Use terminal value or predicted value
+            value = leaf_node.terminal_value if leaf_node.is_terminal else leaf_node.total_value / max(1, leaf_node.visit_count)
+
+            # Backpropagate through the path
+            # Values alternate perspective
+            current_value = -value
+            for node in reversed(path):
+                node.virtual_loss -= 1 # Remove virtual loss
+                node.visit_count += 1
+                node.total_value += current_value
+                current_value = -current_value
     
     def _expand_and_evaluate(self, board: chess.Board, node: MCTSNode) -> float:
         """Expand node and evaluate position with neural network."""
@@ -329,10 +397,9 @@ class MCTS:
         # Evaluate with neural network
         self.model.eval()
         with torch.no_grad():
-            data = self.encoder.board_to_graph(board)
-            data = data.to(self.device)
+            tensor = self.encoder.board_to_tensor(board).unsqueeze(0).to(self.device)
             
-            policy_logits, value, _ = self.model(data)
+            policy_logits, value = self.model(tensor)
             value = value.item()
             
             # Get move probabilities
@@ -346,7 +413,7 @@ class MCTS:
 
         for move in legal_moves:
             move_idx = move_encoder.move_to_index(move)
-            if move_idx < len(policy_probs):
+            if move_idx != -1:
                 prior = policy_probs[move_idx]
             else:
                 prior = 0.0
@@ -370,29 +437,26 @@ class MCTS:
         
         return value
     
-    def _select_child(self, node: MCTSNode) -> Tuple[chess.Move, MCTSNode]:
+    def _select_child(self, node: MCTSNode, use_virtual_loss: bool = False) -> Tuple[chess.Move, MCTSNode]:
         """Select child with highest UCT value."""
         best_move = None
         best_child = None
         best_value = -float('inf')
         
-        # Optimization: Pre-calculate constants for UCT to avoid repeated math/method calls
-        # Use log-based exploration for better behavior at high visit counts
-        sqrt_parent_visits = math.sqrt(node.visit_count)
+        visits = node.visit_count + (node.virtual_loss if use_virtual_loss else 0)
+        sqrt_parent_visits = math.sqrt(max(1, visits))
         c_puct_sqrt = self.c_puct * sqrt_parent_visits
 
-        # Shuffle children to break ties randomly
         items = list(node.children.items())
         np.random.shuffle(items)
 
         for move, child in items:
-            # Inlined and optimized UCT calculation
-            if child.visit_count == 0:
-                # Add small epsilon to prior to avoid zero uct
+            child_visits = child.visit_count + (child.virtual_loss if use_virtual_loss else 0)
+            if child_visits == 0:
                 uct = c_puct_sqrt * (child.prior_prob + 1e-8)
             else:
-                q = child.total_value / child.visit_count
-                u = c_puct_sqrt * child.prior_prob / (1 + child.visit_count)
+                q = child.total_value / child_visits
+                u = c_puct_sqrt * child.prior_prob / (1 + child_visits)
                 uct = q + u
             
             if uct > best_value:
@@ -485,11 +549,11 @@ if __name__ == "__main__":
     # Test MCTS
     print("Testing MCTS implementation...")
     
-    from model import ArchimedesGNN, ChessBoardEncoder
+    from model import ChessResNet, AlphaZeroEncoder
     
     # Create model and encoder
-    encoder = ChessBoardEncoder()
-    model = ArchimedesGNN()
+    encoder = AlphaZeroEncoder()
+    model = ChessResNet()
     model.eval()
     
     # Create MCTS

@@ -1,459 +1,300 @@
 """
-Archimedes Chess AI - Graph Neural Network Model
-PyTorch Geometric implementation with attention mechanisms for chess position evaluation.
+DistillZero - Chess ResNet Architecture
+AlphaZero-inspired ResNet for high-performance chess evaluation.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
-from torch_geometric.data import Data, Batch
 import chess
 import numpy as np
-from typing import Tuple, List, Dict
-
-
-class ChessBoardEncoder:
-    """
-    Encodes chess board positions as graphs for GNN processing.
-    Nodes = pieces, Edges = attacks/defends relationships.
-    """
-    
-    # Piece type encoding
-    PIECE_TO_IDX = {
-        chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-        chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
-    }
-    
-    def __init__(self, feature_dim: int = 32):
-        self.feature_dim = feature_dim
-    
-    def board_to_graph(self, board: chess.Board) -> Data:
-        """
-        Convert chess board to PyTorch Geometric Data object.
-        
-        Node features (per piece):
-        - Piece type (one-hot, 6 dims)
-        - Color (1 dim: 1=white, -1=black)
-        - Position (x, y normalized to [0,1], 2 dims)
-        - Mobility (number of legal moves, 1 dim)
-        - Is attacked (1 dim)
-        - Is defended (1 dim)
-        - Material value (1 dim)
-        - Distance to enemy king (1 dim)
-        - Distance to own king (1 dim)
-        Total: 15 base features
-        
-        Edge features:
-        - Attack relationship (1 dim)
-        - Defense relationship (1 dim)
-        - Distance (1 dim)
-        """
-        
-        # Collect pieces
-        pieces = []
-        piece_squares = {}
-        
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece:
-                pieces.append((square, piece))
-                piece_squares[square] = len(pieces) - 1
-        
-        if len(pieces) == 0:
-            # Empty board edge case - Use an empty graph representation that won't skew pooling
-            # PyTorch Geometric's Batch objects handle zero-node graphs if we're careful.
-            # But here we'll return a zero-filled feature for a 'virtual' empty board node
-            # but mark it with a special feature.
-            x = torch.zeros((0, 15), dtype=torch.float32)
-            edge_index = torch.zeros((2, 0), dtype=torch.long)
-            edge_attr = torch.zeros((0, 3), dtype=torch.float32)
-            global_features = torch.zeros((7,), dtype=torch.float32)
-            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_features=global_features)
-        
-        # Build node features
-        node_features = []
-        white_king_sq = board.king(chess.WHITE)
-        black_king_sq = board.king(chess.BLACK)
-        
-        for square, piece in pieces:
-            # Piece type (one-hot)
-            piece_type = [0.0] * 6
-            piece_type[self.PIECE_TO_IDX[piece.piece_type]] = 1.0
-            
-            # Color
-            color = 1.0 if piece.color == chess.WHITE else -1.0
-            
-            # Position (normalized)
-            rank = chess.square_rank(square) / 7.0
-            file = chess.square_file(square) / 7.0
-            
-            # Mobility (pseudo-legal moves from this square)
-            mobility = len([m for m in board.legal_moves if m.from_square == square]) / 27.0  # Normalize
-            
-            # Is attacked / defended
-            is_attacked = 1.0 if board.is_attacked_by(not piece.color, square) else 0.0
-            is_defended = 1.0 if board.is_attacked_by(piece.color, square) else 0.0
-            
-            # Material value (normalized)
-            material_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
-                             chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
-            material = material_values[piece.piece_type] / 9.0
-            
-            # Distance to kings (Chebyshev distance, normalized)
-            enemy_king = black_king_sq if piece.color == chess.WHITE else white_king_sq
-            own_king = white_king_sq if piece.color == chess.WHITE else black_king_sq
-            
-            dist_enemy_king = chess.square_distance(square, enemy_king) / 7.0 if enemy_king else 1.0
-            dist_own_king = chess.square_distance(square, own_king) / 7.0 if own_king else 1.0
-            
-            # Combine features
-            features = piece_type + [color, rank, file, mobility, is_attacked, 
-                                    is_defended, material, dist_enemy_king, dist_own_king]
-            node_features.append(features)
-        
-        x = torch.tensor(node_features, dtype=torch.float32)
-        
-        # Build edges (attack/defense relationships)
-        edge_list = []
-        edge_features = []
-        
-        for i, (sq1, piece1) in enumerate(pieces):
-            for j, (sq2, piece2) in enumerate(pieces):
-                if i == j:
-                    continue
-                
-                # Check if piece1 attacks square of piece2
-                attacks = board.is_attacked_by(piece1.color, sq2)
-                
-                if attacks or chess.square_distance(sq1, sq2) <= 2:  # Connect nearby pieces
-                    edge_list.append([i, j])
-                    
-                    # Edge features
-                    is_attack = 1.0 if (attacks and piece1.color != piece2.color) else 0.0
-                    is_defense = 1.0 if (attacks and piece1.color == piece2.color) else 0.0
-                    distance = chess.square_distance(sq1, sq2) / 7.0
-                    
-                    edge_features.append([is_attack, is_defense, distance])
-        
-        if edge_list:
-            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-            edge_attr = torch.tensor(edge_features, dtype=torch.float32)
-        else:
-            edge_index = torch.zeros((2, 0), dtype=torch.long)
-            edge_attr = torch.zeros((0, 3), dtype=torch.float32)
-        
-        # Global features (board state)
-        turn = 1.0 if board.turn == chess.WHITE else -1.0
-        castling_rights = [
-            1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0,
-            1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0,
-            1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0,
-            1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0,
-        ]
-        halfmove_clock = board.halfmove_clock / 100.0
-        fullmove_number = min(board.fullmove_number / 100.0, 1.0)
-        
-        global_features = torch.tensor(
-            [turn] + castling_rights + [halfmove_clock, fullmove_number],
-            dtype=torch.float32
-        )
-        
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, 
-                   global_features=global_features)
-
-
-class ArchimedesGNN(nn.Module):
-    """
-    Graph Neural Network for chess position evaluation.
-    Uses Graph Attention Networks (GAT) for learning piece relationships.
-    """
-    
-    def __init__(self, 
-                 node_features: int = 15,
-                 edge_features: int = 3,
-                 global_features: int = 7,
-                 hidden_dim: int = 256,
-                 num_layers: int = 4,
-                 num_heads: int = 8,
-                 dropout: float = 0.1,
-                 num_policy_outputs: int = 16384):  # 4096 * 4 (collision-free flat encoding)
-        super().__init__()
-        
-        self.node_features = node_features
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        
-        # Input projection
-        self.node_encoder = nn.Linear(node_features, hidden_dim)
-        self.edge_encoder = nn.Linear(edge_features, hidden_dim)
-        self.global_encoder = nn.Linear(global_features, hidden_dim)
-        
-        # GAT layers with residual connections
-        self.gat_layers = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
-        
-        for i in range(num_layers):
-            self.gat_layers.append(
-                GATConv(
-                    hidden_dim,
-                    hidden_dim // num_heads,
-                    heads=num_heads,
-                    dropout=dropout,
-                    edge_dim=hidden_dim,
-                    concat=True
-                )
-            )
-            self.layer_norms.append(nn.LayerNorm(hidden_dim))
-        
-        # Pooling
-        self.pool_attention = nn.Linear(hidden_dim, 1)
-        
-        # Head input dim: pooled_weighted (1) + pooled_mean (1) + pooled_max (1) + global (1) = 4 * hidden_dim
-        head_input_dim = hidden_dim * 4
-
-        # Policy head (move prediction)
-        self.policy_head = nn.Sequential(
-            nn.Linear(head_input_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_policy_outputs)
-        )
-        
-        # Value head (position evaluation)
-        self.value_head = nn.Sequential(
-            nn.Linear(head_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Tanh()
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, data: Data) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Forward pass.
-        
-        Returns:
-            policy: (batch_size, num_policy_outputs) - move probabilities
-            value: (batch_size, 1) - position evaluation [-1, 1]
-            aux: Dictionary with auxiliary outputs for visualization
-        """
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.size(0), dtype=torch.long)
-        global_feat = data.global_features if hasattr(data, 'global_features') else None
-        
-        # Encode inputs
-        x = self.node_encoder(x)
-        x = F.relu(x)
-        
-        if edge_attr.size(0) > 0:
-            edge_attr = self.edge_encoder(edge_attr)
-            edge_attr = F.relu(edge_attr)
-        else:
-            edge_attr = torch.zeros((0, self.hidden_dim), device=x.device)
-        
-        # Store attention weights for visualization
-        attention_weights = []
-        
-        # GAT layers with residual connections
-        for i, (gat, norm) in enumerate(zip(self.gat_layers, self.layer_norms)):
-            x_residual = x
-            
-            if edge_index.size(1) > 0:
-                x = gat(x, edge_index, edge_attr=edge_attr)
-            
-            x = self.dropout(x)
-            x = x + x_residual  # Residual connection
-            x = norm(x)
-            x = F.relu(x)
-        
-        # Handle empty graphs in batch
-        if x.size(0) == 0:
-            # This case happens if the entire batch is empty (rare) or single empty graph
-            num_graphs = batch.max().item() + 1 if batch.numel() > 0 else 1
-            device = x.device
-            graph_repr = torch.zeros((num_graphs, self.hidden_dim * 3 + self.hidden_dim), device=device)
-            policy_logits = self.policy_head(graph_repr)
-            value = self.value_head(graph_repr)
-            return policy_logits, value, {'attention_weights': [], 'node_embeddings': x}
-
-        # Global pooling (attention-based + mean + max)
-        attention_scores = torch.sigmoid(self.pool_attention(x))
-        attention_weights.append(attention_scores)
-        
-        # Weighted pooling
-        weighted_x = x * attention_scores
-        pooled_weighted = global_mean_pool(weighted_x, batch)
-        
-        # Standard pooling
-        pooled_mean = global_mean_pool(x, batch)
-        pooled_max = global_max_pool(x, batch)
-        
-        # Combine pooled representations
-        graph_repr = torch.cat([pooled_weighted, pooled_mean, pooled_max], dim=-1)
-        
-        # Add global features if available
-        if global_feat is not None:
-            if global_feat.dim() == 1:
-                global_feat = global_feat.unsqueeze(0)
-            global_encoded = self.global_encoder(global_feat)
-            global_encoded = F.relu(global_encoded)
-            graph_repr = torch.cat([graph_repr, global_encoded], dim=-1)
-        
-        # Policy and value heads
-        policy_logits = self.policy_head(graph_repr)
-        value = self.value_head(graph_repr)
-        
-        # Auxiliary outputs for visualization
-        aux = {
-            'attention_weights': attention_weights,
-            'node_embeddings': x,
-            'graph_representation': graph_repr,
-        }
-        
-        return policy_logits, value, aux
-    
-    def get_move_probabilities(self, board: chess.Board, encoder: ChessBoardEncoder, 
-                               temperature: float = 1.0) -> Dict[str, float]:
-        """
-        Get move probabilities for a given board position.
-        
-        Returns:
-            Dictionary mapping UCI moves to probabilities
-        """
-        self.eval()
-        
-        with torch.no_grad():
-            # Encode board
-            data = encoder.board_to_graph(board)
-            data = data.to(next(self.parameters()).device)
-            
-            # Forward pass
-            policy_logits, value, aux = self(data)
-            
-            # Apply temperature
-            policy_logits = policy_logits / temperature
-            
-            # Get legal moves
-            legal_moves = list(board.legal_moves)
-            
-            # Map moves to indices (simplified - in practice use proper move encoding)
-            move_probs = {}
-            policy_probs = F.softmax(policy_logits[0], dim=0)
-            
-            move_encoder = MoveEncoder()
-            for i, move in enumerate(legal_moves):
-                move_idx = move_encoder.move_to_index(move)
-                if move_idx < policy_probs.size(0):
-                    move_probs[move.uci()] = policy_probs[move_idx].item()
-                else:
-                    move_probs[move.uci()] = 0.0
-            
-            # Normalize
-            total = sum(move_probs.values())
-            if total > 0:
-                move_probs = {k: v/total for k, v in move_probs.items()}
-            
-            return move_probs, value.item(), aux
+from typing import Tuple, List, Dict, Optional
 
 
 class MoveEncoder:
     """
     Encodes chess moves to indices for policy head.
-    Collision-free encoding.
+    1,968 possible legal moves mapping.
     """
-    
-    @staticmethod
-    def move_to_index(move: chess.Move) -> int:
-        """
-        Convert move to index.
-        Base: from_square * 64 + to_square (0-4095)
-        Promotions: add 4096 * (1: Knight, 2: Bishop, 3: Rook, 0/None/Queen: 0)
-        Total size: 4096 * 4 = 16384
-        """
-        from_sq = move.from_square
-        to_sq = move.to_square
-        base_idx = from_sq * 64 + to_sq
-        
-        if move.promotion and move.promotion != chess.QUEEN:
-            promotion_map = {
-                chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3
-            }
-            offset = promotion_map.get(move.promotion, 0)
-            return 4096 * offset + base_idx
-        
-        return base_idx
-    
-    @staticmethod
-    def index_to_move(index: int, board: chess.Board) -> chess.Move:
-        """
-        Convert index back to move.
-        """
-        offset = index // 4096
-        base_idx = index % 4096
+    def __init__(self):
+        # Generate all possible move triplets (from, to, promotion)
+        # that could ever be legal for any piece.
+        self.all_moves = []
+        for square in chess.SQUARES:
+            # Queen-like moves
+            r, c = chess.square_rank(square), chess.square_file(square)
+            for dr, dc in [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]:
+                for dist in range(1, 8):
+                    nr, nc = r + dist*dr, c + dist*dc
+                    if 0 <= nr < 8 and 0 <= nc < 8:
+                        self.all_moves.append((square, chess.square(nc, nr), None))
+                    else:
+                        break
+            # Knight moves
+            for dr, dc in [(2,1), (2,-1), (-2,1), (-2,-1), (1,2), (1,-2), (-1,2), (-1,-2)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    self.all_moves.append((square, chess.square(nc, nr), None))
+            
+            # Pawn moves and promotions
+            # White pawn
+            if r < 7:
+                # We include all possible pawn moves from any square (except rank 0/7)
+                # to keep the mapping consistent.
+                if r > 0:
+                    # Forward
+                    target = chess.square(c, r+1)
+                    if r == 6: # Promotion
+                        for prom in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                            self.all_moves.append((square, target, prom))
+                    else:
+                        self.all_moves.append((square, target, None))
+                        if r == 1: # Double push
+                            self.all_moves.append((square, chess.square(c, r+2), None))
 
-        from_sq = base_idx // 64
-        to_sq = base_idx % 64
-        
-        promotion_map = {
-            0: chess.QUEEN if (chess.square_rank(to_sq) in [0, 7] and
-                             board.piece_at(from_sq) and
-                             board.piece_at(from_sq).piece_type == chess.PAWN) else None,
-            1: chess.KNIGHT,
-            2: chess.BISHOP,
-            3: chess.ROOK
-        }
-        
-        try:
-            move = chess.Move(from_sq, to_sq, promotion=promotion_map.get(offset))
-            if move in board.legal_moves:
-                return move
-            # Try without promotion if mapped promotion was QUEEN but it's illegal
-            if offset == 0:
-                move = chess.Move(from_sq, to_sq)
-                if move in board.legal_moves:
-                    return move
-        except:
-            pass
-        
+                    # Captures
+                    for dc in [-1, 1]:
+                        nc = c + dc
+                        if 0 <= nc < 8:
+                            target = chess.square(nc, r+1)
+                            if r == 6:
+                                for prom in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                                    self.all_moves.append((square, target, prom))
+                            else:
+                                self.all_moves.append((square, target, None))
+            
+            # Black pawn
+            if r > 0:
+                if r < 7:
+                    # Forward
+                    target = chess.square(c, r-1)
+                    if r == 1: # Promotion
+                        for prom in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                            self.all_moves.append((square, target, prom))
+                    else:
+                        self.all_moves.append((square, target, None))
+                        if r == 6: # Double push
+                            self.all_moves.append((square, chess.square(c, r-2), None))
+
+                    # Captures
+                    for dc in [-1, 1]:
+                        nc = c + dc
+                        if 0 <= nc < 8:
+                            target = chess.square(nc, r-1)
+                            if r == 1:
+                                for prom in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                                    self.all_moves.append((square, target, prom))
+                            else:
+                                self.all_moves.append((square, target, None))
+
+        # Castling
+        self.all_moves.append((chess.E1, chess.G1, None))
+        self.all_moves.append((chess.E1, chess.C1, None))
+        self.all_moves.append((chess.E8, chess.G8, None))
+        self.all_moves.append((chess.E8, chess.C8, None))
+
+        # Deduplicate and sort
+        # Using a custom sort key to handle None values in promotion
+        self.all_moves = sorted(list(set(self.all_moves)),
+                              key=lambda x: (x[0], x[1], x[2] if x[2] is not None else 0))
+        self.move_to_idx = {m: i for i, m in enumerate(self.all_moves)}
+        self.idx_to_move_tuple = {i: m for i, m in enumerate(self.all_moves)}
+
+        # Verify size
+        assert len(self.all_moves) == 1968, f"Expected 1968 moves, got {len(self.all_moves)}"
+
+    def move_to_index(self, move: chess.Move) -> int:
+        m = (move.from_square, move.to_square, move.promotion)
+        return self.move_to_idx.get(m, -1)
+
+    def index_to_move(self, index: int) -> Optional[chess.Move]:
+        m = self.idx_to_move_tuple.get(index)
+        if m:
+            return chess.Move(m[0], m[1], m[2])
         return None
 
 
+class AlphaZeroEncoder:
+    """
+    Encodes chess board into 119 planes (8x8x119).
+    """
+    def __init__(self, history_len: int = 8):
+        self.history_len = history_len
+
+    def board_to_tensor(self, board: chess.Board) -> torch.Tensor:
+        """
+        Convert board to (119, 8, 8) tensor.
+        """
+        planes = np.zeros((119, 8, 8), dtype=np.float32)
+        
+        # Fill history planes (14 planes per step)
+        # For simplicity in this implementation, if history is not available (e.g. FEN input),
+        # we only fill the current state and zero out the rest.
+        # If board.move_stack is available, we could reconstruct history.
+        
+        current_board = board.copy()
+        for i in range(self.history_len):
+            offset = i * 14
+            self._fill_14_planes(current_board, planes, offset)
+
+            if len(current_board.move_stack) > 0:
+                current_board.pop()
+            else:
+                # No more history available
+                break
+        
+        # Fill constant planes (last 7 planes)
+        offset = 112
+        # Plane 112: Color (1 if white, 0 if black)
+        planes[offset] = 1.0 if board.turn == chess.WHITE else 0.0
+        # Plane 113: Total move count (normalized)
+        planes[offset+1] = board.fullmove_number / 100.0
+        # Planes 114-117: Castling rights
+        planes[offset+2] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+        planes[offset+3] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+        planes[offset+4] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+        planes[offset+5] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+        # Plane 118: No-progress count (50-move rule)
+        planes[offset+6] = board.halfmove_clock / 100.0
+        
+        return torch.from_numpy(planes)
+
+    def _fill_14_planes(self, board: chess.Board, planes: np.ndarray, offset: int):
+        """Fills 12 piece planes and 2 repetition planes for a given board state."""
+        # 6 piece types for current player, then 6 for opponent
+        # We always encode from the perspective of the current player?
+        # Actually, AlphaZero encodes white pieces then black pieces?
+        # Standard: 6 planes for White, 6 for Black.
+        
+        piece_map = {
+            chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
+        }
+        
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                rank = chess.square_rank(square)
+                file = chess.square_file(square)
+                p_idx = piece_map[piece.piece_type]
+                if piece.color == chess.WHITE:
+                    planes[offset + p_idx, rank, file] = 1.0
+                else:
+                    planes[offset + 6 + p_idx, rank, file] = 1.0
+        
+        # Repetition planes (13 and 14 in the 14-block)
+        # Note: True repetition counting requires full game history.
+        # Since we often train on isolated FENs (e.g. from the factory),
+        # these planes are left as 0. For full strength, the input should
+        # include the previous 7 board states via the board.move_stack.
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
+
+
+class ChessResNet(nn.Module):
+    """
+    AlphaZero-style ResNet for chess.
+    10 ResNet blocks, 256 channels.
+    """
+    def __init__(self, input_channels: int = 119, num_blocks: int = 10, channels: int = 128, num_policy_outputs: int = 1968):
+        super().__init__()
+        
+        # Initial convolution
+        self.conv_input = nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn_input = nn.BatchNorm2d(channels)
+        
+        # Backbone (Residual Blocks)
+        self.res_blocks = nn.ModuleList([ResBlock(channels) for _ in range(num_blocks)])
+        
+        # Policy Head
+        # AlphaZero uses a reduction to 2 filters before the linear layer to save parameters
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(2 * 8 * 8, num_policy_outputs)
+        )
+        
+        # Value Head
+        # AlphaZero uses a reduction to 1 filter then a hidden linear layer
+        self.value_head = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(1 * 8 * 8, channels),
+            nn.ReLU(),
+            nn.Linear(channels, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = F.relu(self.bn_input(self.conv_input(x)))
+        
+        for block in self.res_blocks:
+            x = block(x)
+            
+        policy_logits = self.policy_head(x)
+        value = self.value_head(x)
+        
+        return policy_logits, value
+
+    def export_torchscript(self, output_path: str = "model_traced.pt"):
+        """Export model to TorchScript for faster inference."""
+        self.eval()
+        dummy_input = torch.randn(1, 119, 8, 8)
+        traced = torch.jit.trace(self, dummy_input)
+        traced.save(output_path)
+        print(f"Model exported to TorchScript: {output_path}")
+
+    def export_onnx(self, output_path: str = "model.onnx"):
+        """Export model to ONNX."""
+        self.eval()
+        dummy_input = torch.randn(1, 119, 8, 8)
+        torch.onnx.export(
+            self, dummy_input, output_path,
+            input_names=['board'], output_names=['policy', 'value'],
+            dynamic_axes={'board': {0: 'batch'}}
+        )
+        print(f"Model exported to ONNX: {output_path}")
+
+
 if __name__ == "__main__":
-    # Test the model
-    print("Testing Archimedes GNN Model...")
+    # Test
+    print("Initializing components...")
+    encoder = AlphaZeroEncoder()
+    move_encoder = MoveEncoder()
+    model = ChessResNet()
     
-    # Create encoder and model
-    encoder = ChessBoardEncoder()
-    model = ArchimedesGNN()
-    
-    # Test with starting position
     board = chess.Board()
-    data = encoder.board_to_graph(board)
+    tensor = encoder.board_to_tensor(board).unsqueeze(0)
     
-    print(f"Graph nodes: {data.x.size(0)}")
-    print(f"Graph edges: {data.edge_index.size(1)}")
-    print(f"Node features: {data.x.size(1)}")
+    print(f"Input shape: {tensor.shape}")
     
-    # Forward pass
-    policy, value, aux = model(data)
+    policy, value = model(tensor)
     
     print(f"Policy shape: {policy.shape}")
-    print(f"Value: {value.item():.3f}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Value shape: {value.shape}")
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Test move probabilities
-    move_probs, val, _ = model.get_move_probabilities(board, encoder)
-    print(f"\nTop 5 moves:")
-    for move, prob in sorted(move_probs.items(), key=lambda x: x[1], reverse=True)[:5]:
-        print(f"  {move}: {prob:.4f}")
-    
-    print("\nModel test completed successfully!")
+    # Test move encoding
+    move = chess.Move.from_uci("e2e4")
+    idx = move_encoder.move_to_index(move)
+    print(f"Move e2e4 index: {idx}")
+    back_move = move_encoder.index_to_move(idx)
+    print(f"Back to move: {back_move.uci() if back_move else 'None'}")

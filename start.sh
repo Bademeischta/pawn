@@ -70,10 +70,6 @@ else
     pip install torch torchvision torchaudio
 fi
 
-# Install PyTorch Geometric
-echo "Installing PyTorch Geometric..."
-pip install torch-geometric torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
-
 # Install other requirements
 echo "Installing other dependencies..."
 pip install -r requirements.txt
