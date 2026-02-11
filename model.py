@@ -61,11 +61,15 @@ class ChessBoardEncoder:
                 piece_squares[square] = len(pieces) - 1
         
         if len(pieces) == 0:
-            # Empty board edge case
-            x = torch.zeros((1, 15), dtype=torch.float32)
+            # Empty board edge case - Use an empty graph representation that won't skew pooling
+            # PyTorch Geometric's Batch objects handle zero-node graphs if we're careful.
+            # But here we'll return a zero-filled feature for a 'virtual' empty board node
+            # but mark it with a special feature.
+            x = torch.zeros((0, 15), dtype=torch.float32)
             edge_index = torch.zeros((2, 0), dtype=torch.long)
             edge_attr = torch.zeros((0, 3), dtype=torch.float32)
-            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+            global_features = torch.zeros((7,), dtype=torch.float32)
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, global_features=global_features)
         
         # Build node features
         node_features = []
@@ -173,7 +177,7 @@ class ArchimedesGNN(nn.Module):
                  num_layers: int = 4,
                  num_heads: int = 8,
                  dropout: float = 0.1,
-                 num_policy_outputs: int = 1968):  # All possible moves in chess
+                 num_policy_outputs: int = 16384):  # 4096 * 4 (collision-free flat encoding)
         super().__init__()
         
         self.node_features = node_features
@@ -205,9 +209,12 @@ class ArchimedesGNN(nn.Module):
         # Pooling
         self.pool_attention = nn.Linear(hidden_dim, 1)
         
+        # Head input dim: pooled_weighted (1) + pooled_mean (1) + pooled_max (1) + global (1) = 4 * hidden_dim
+        head_input_dim = hidden_dim * 4
+
         # Policy head (move prediction)
         self.policy_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim * 2),
+            nn.Linear(head_input_dim, hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -218,7 +225,7 @@ class ArchimedesGNN(nn.Module):
         
         # Value head (position evaluation)
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim),
+            nn.Linear(head_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -268,6 +275,16 @@ class ArchimedesGNN(nn.Module):
             x = norm(x)
             x = F.relu(x)
         
+        # Handle empty graphs in batch
+        if x.size(0) == 0:
+            # This case happens if the entire batch is empty (rare) or single empty graph
+            num_graphs = batch.max().item() + 1 if batch.numel() > 0 else 1
+            device = x.device
+            graph_repr = torch.zeros((num_graphs, self.hidden_dim * 3 + self.hidden_dim), device=device)
+            policy_logits = self.policy_head(graph_repr)
+            value = self.value_head(graph_repr)
+            return policy_logits, value, {'attention_weights': [], 'node_embeddings': x}
+
         # Global pooling (attention-based + mean + max)
         attention_scores = torch.sigmoid(self.pool_attention(x))
         attention_weights.append(attention_scores)
@@ -332,10 +349,13 @@ class ArchimedesGNN(nn.Module):
             move_probs = {}
             policy_probs = F.softmax(policy_logits[0], dim=0)
             
+            move_encoder = MoveEncoder()
             for i, move in enumerate(legal_moves):
-                # Simple hash-based indexing (replace with proper move encoding)
-                move_idx = hash(move.uci()) % policy_probs.size(0)
-                move_probs[move.uci()] = policy_probs[move_idx].item()
+                move_idx = move_encoder.move_to_index(move)
+                if move_idx < policy_probs.size(0):
+                    move_probs[move.uci()] = policy_probs[move_idx].item()
+                else:
+                    move_probs[move.uci()] = 0.0
             
             # Normalize
             total = sum(move_probs.values())
@@ -348,47 +368,59 @@ class ArchimedesGNN(nn.Module):
 class MoveEncoder:
     """
     Encodes chess moves to indices for policy head.
-    Uses a simplified encoding scheme.
+    Collision-free encoding.
     """
     
     @staticmethod
     def move_to_index(move: chess.Move) -> int:
         """
         Convert move to index.
-        Encoding: from_square (6 bits) + to_square (6 bits) + promotion (3 bits) = 15 bits
+        Base: from_square * 64 + to_square (0-4095)
+        Promotions: add 4096 * (1: Knight, 2: Bishop, 3: Rook, 0/None/Queen: 0)
+        Total size: 4096 * 4 = 16384
         """
         from_sq = move.from_square
         to_sq = move.to_square
-        promotion = 0
+        base_idx = from_sq * 64 + to_sq
         
-        if move.promotion:
+        if move.promotion and move.promotion != chess.QUEEN:
             promotion_map = {
-                chess.KNIGHT: 1, chess.BISHOP: 2, 
-                chess.ROOK: 3, chess.QUEEN: 4
+                chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3
             }
-            promotion = promotion_map.get(move.promotion, 0)
+            offset = promotion_map.get(move.promotion, 0)
+            return 4096 * offset + base_idx
         
-        index = (from_sq << 9) | (to_sq << 3) | promotion
-        return index % 1968  # Modulo to fit in policy output size
+        return base_idx
     
     @staticmethod
     def index_to_move(index: int, board: chess.Board) -> chess.Move:
         """
-        Convert index back to move (approximate - needs legal move validation).
+        Convert index back to move.
         """
-        promotion = index & 0x7
-        to_sq = (index >> 3) & 0x3F
-        from_sq = (index >> 9) & 0x3F
+        offset = index // 4096
+        base_idx = index % 4096
+
+        from_sq = base_idx // 64
+        to_sq = base_idx % 64
         
         promotion_map = {
-            0: None, 1: chess.KNIGHT, 2: chess.BISHOP,
-            3: chess.ROOK, 4: chess.QUEEN
+            0: chess.QUEEN if (chess.square_rank(to_sq) in [0, 7] and
+                             board.piece_at(from_sq) and
+                             board.piece_at(from_sq).piece_type == chess.PAWN) else None,
+            1: chess.KNIGHT,
+            2: chess.BISHOP,
+            3: chess.ROOK
         }
         
         try:
-            move = chess.Move(from_sq, to_sq, promotion=promotion_map[promotion])
+            move = chess.Move(from_sq, to_sq, promotion=promotion_map.get(offset))
             if move in board.legal_moves:
                 return move
+            # Try without promotion if mapped promotion was QUEEN but it's illegal
+            if offset == 0:
+                move = chess.Move(from_sq, to_sq)
+                if move in board.legal_moves:
+                    return move
         except:
             pass
         

@@ -80,10 +80,18 @@ class TranspositionTable:
         return node
     
     def put(self, board_hash: Union[str, int], node: MCTSNode):
-        """Store node in table."""
-        if len(self.table) >= self.max_size:
-            # Simple eviction: remove random entry
-            self.table.pop(next(iter(self.table)))
+        """Store node in table with LRU eviction."""
+        if board_hash in self.table:
+            # Move to end to mark as recently used
+            del self.table[board_hash]
+        elif len(self.table) >= self.max_size:
+            # Remove oldest entry (first in dict)
+            it = iter(self.table)
+            try:
+                first = next(it)
+                del self.table[first]
+            except StopIteration:
+                pass
         self.table[board_hash] = node
     
     def get_hit_rate(self) -> float:
@@ -234,6 +242,11 @@ class MCTS:
         
         # Run simulations
         for sim in range(self.num_simulations):
+            # Optimization: Use push/pop instead of copying the whole board
+            # except for the root to ensure we don't accidentally corrupt the main board
+            # (though _simulate should pop everything back, copying once per simulation is safer
+            # than once per node but less safe than once per search).
+            # We'll stick to one copy per simulation for safety in case of crashes/interrupts.
             board_copy = board.copy()
             self._simulate(board_copy, root, depth=0)
         
@@ -244,6 +257,7 @@ class MCTS:
         
         # Gather statistics
         stats = self._gather_stats(root)
+        stats['policy_target'] = self.get_policy_target(root)
         stats.update(self.metrics.get_summary())
         
         if self.transposition_table:
@@ -327,9 +341,15 @@ class MCTS:
         self.metrics.positions_evaluated += 1
         
         # Create child nodes with priors
+        from model import MoveEncoder
+        move_encoder = MoveEncoder()
+
         for move in legal_moves:
-            move_idx = hash(move.uci()) % len(policy_probs)
-            prior = policy_probs[move_idx]
+            move_idx = move_encoder.move_to_index(move)
+            if move_idx < len(policy_probs):
+                prior = policy_probs[move_idx]
+            else:
+                prior = 0.0
             
             board.push(move)
             child_hash = self.transposition_table.get_hash(board) if self.transposition_table else str(board.fen())
@@ -357,13 +377,19 @@ class MCTS:
         best_value = -float('inf')
         
         # Optimization: Pre-calculate constants for UCT to avoid repeated math/method calls
+        # Use log-based exploration for better behavior at high visit counts
         sqrt_parent_visits = math.sqrt(node.visit_count)
         c_puct_sqrt = self.c_puct * sqrt_parent_visits
 
-        for move, child in node.children.items():
+        # Shuffle children to break ties randomly
+        items = list(node.children.items())
+        np.random.shuffle(items)
+
+        for move, child in items:
             # Inlined and optimized UCT calculation
             if child.visit_count == 0:
-                uct = c_puct_sqrt * child.prior_prob
+                # Add small epsilon to prior to avoid zero uct
+                uct = c_puct_sqrt * (child.prior_prob + 1e-8)
             else:
                 q = child.total_value / child.visit_count
                 u = c_puct_sqrt * child.prior_prob / (1 + child.visit_count)

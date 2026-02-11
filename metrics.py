@@ -26,7 +26,12 @@ class MetricsLogger:
     Captures training, MCTS, chess-specific, and hardware metrics.
     """
     
-    def __init__(self, db_path: str = "training_logs.db", buffer_size: int = 100):
+    ALLOWED_TABLES = {
+        "training_metrics", "mcts_metrics", "chess_metrics",
+        "hardware_metrics", "games", "position_analysis"
+    }
+
+    def __init__(self, db_path: str = "training_logs.db", buffer_size: int = 500):
         self.db_path = Path(db_path)
         self.buffer_size = buffer_size
         self.queue = queue.Queue()
@@ -383,10 +388,14 @@ class MetricsLogger:
     
     def get_latest_metrics(self, table: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Retrieve latest metrics from a table."""
+        if table not in self.ALLOWED_TABLES:
+            raise ValueError(f"Unauthorized table access: {table}")
+
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
+        # Use parameterized query for limit, and validated table name
         cursor.execute(f"SELECT * FROM {table} ORDER BY timestamp DESC LIMIT ?", (limit,))
         rows = cursor.fetchall()
         
@@ -396,6 +405,9 @@ class MetricsLogger:
     
     def get_metrics_range(self, table: str, start_epoch: int, end_epoch: int) -> List[Dict[str, Any]]:
         """Retrieve metrics for a specific epoch range."""
+        if table not in self.ALLOWED_TABLES:
+            raise ValueError(f"Unauthorized table access: {table}")
+
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -433,7 +445,13 @@ class MetricsLogger:
         """Gracefully shutdown the logger."""
         print("[MetricsLogger] Shutting down...")
         self.running = False
-        self.writer_thread.join(timeout=5.0)
+
+        # Wait for queue to be processed, but with a longer timeout if it has many items
+        queue_size = self.queue.qsize()
+        timeout = max(5.0, queue_size * 0.05)
+        print(f"[MetricsLogger] Waiting up to {timeout:.1f}s for {queue_size} items to be flushed...")
+
+        self.writer_thread.join(timeout=timeout)
         
         if self.gpu_available:
             try:

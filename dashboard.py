@@ -40,54 +40,45 @@ class DashboardData:
     
     def __init__(self, db_path: str = "training_logs.db"):
         self.db_path = db_path
+
+    def _safe_query(self, query: str, params: tuple = ()) -> pd.DataFrame:
+        """Execute a query safely and return a DataFrame."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                return pd.read_sql_query(query, conn, params=params)
+        except Exception as e:
+            st.error(f"Database error: {e}")
+            return pd.DataFrame()
     
     def get_training_metrics(self, limit: int = 1000) -> pd.DataFrame:
         """Load training metrics."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM training_metrics ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM training_metrics ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
     
     def get_mcts_metrics(self, limit: int = 1000) -> pd.DataFrame:
         """Load MCTS metrics."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM mcts_metrics ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM mcts_metrics ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
     
     def get_chess_metrics(self, limit: int = 1000) -> pd.DataFrame:
         """Load chess-specific metrics."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM chess_metrics ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM chess_metrics ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
     
     def get_hardware_metrics(self, limit: int = 1000) -> pd.DataFrame:
         """Load hardware metrics."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM hardware_metrics ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM hardware_metrics ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
     
     def get_games(self, limit: int = 100) -> pd.DataFrame:
         """Load game records."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM games ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM games ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
     
     def get_position_analysis(self, limit: int = 100) -> pd.DataFrame:
         """Load position analysis data."""
-        conn = sqlite3.connect(self.db_path)
-        query = f"SELECT * FROM position_analysis ORDER BY timestamp DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
+        query = "SELECT * FROM position_analysis ORDER BY timestamp DESC LIMIT ?"
+        return self._safe_query(query, (limit,))
 
 
 @st.cache_resource
@@ -95,17 +86,23 @@ def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
     """Load the trained model."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = ArchimedesGNN()
-    encoder = ChessBoardEncoder()
-    
-    if Path(checkpoint_path).exists():
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        model.eval()
-        return model, encoder, device
-    else:
-        st.warning(f"Checkpoint not found: {checkpoint_path}")
+    try:
+        model = ArchimedesGNN()
+        encoder = ChessBoardEncoder()
+
+        if Path(checkpoint_path).exists():
+            # Use weights_only=True for security if using newer torch versions,
+            # but for compatibility we'll stick to basic load with error handling.
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.to(device)
+            model.eval()
+            return model, encoder, device
+        else:
+            st.warning(f"Checkpoint not found: {checkpoint_path}")
+            return None, None, device
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
         return None, None, device
 
 
@@ -380,7 +377,7 @@ def play_vs_ai_tab(model, encoder, device):
     with col1:
         # Render board
         svg = render_board_svg(board, size=500)
-        st.image(svg, use_column_width=True)
+        st.image(svg, use_container_width=True)
     
     with col2:
         st.subheader("Game Info")
@@ -399,16 +396,21 @@ def play_vs_ai_tab(model, encoder, device):
         
         with col_a:
             if st.button("Make Move"):
-                try:
-                    move = chess.Move.from_uci(move_input)
-                    if move in board.legal_moves:
-                        board.push(move)
-                        st.session_state.move_history.append(move_input)
-                        st.rerun()
-                    else:
-                        st.error("Illegal move!")
-                except:
-                    st.error("Invalid move format!")
+                if not move_input:
+                    st.error("Please enter a move.")
+                else:
+                    try:
+                        move = chess.Move.from_uci(move_input)
+                        if move in board.legal_moves:
+                            board.push(move)
+                            st.session_state.move_history.append(move_input)
+                            st.rerun()
+                        else:
+                            st.error(f"Illegal move: {move_input}")
+                    except ValueError:
+                        st.error(f"Invalid UCI format: {move_input}")
+                    except Exception as e:
+                        st.error(f"Error processing move: {e}")
         
         with col_b:
             if st.button("AI Move"):
@@ -432,12 +434,25 @@ def play_vs_ai_tab(model, encoder, device):
             st.write(" ".join(st.session_state.move_history))
 
 
+def validate_path(path_str: str, allowed_extensions: List[str]) -> bool:
+    """Validate that a path is safe and has an allowed extension."""
+    path = Path(path_str)
+    # Basic path traversal protection
+    if ".." in path_str or path_str.startswith("/"):
+        return False
+    return path.suffix in allowed_extensions
+
+
 def position_analysis_tab(model, encoder, device):
     """Position analysis and visualization."""
     st.header("🔍 Position Analysis")
     
     fen_input = st.text_input("Enter FEN:", value=chess.Board().fen())
     
+    if not fen_input:
+        st.warning("Please enter a FEN string.")
+        return
+
     try:
         board = chess.Board(fen_input)
         
@@ -445,7 +460,7 @@ def position_analysis_tab(model, encoder, device):
         
         with col1:
             svg = render_board_svg(board, size=500)
-            st.image(svg, use_column_width=True)
+            st.image(svg, use_container_width=True)
         
         with col2:
             if model and st.button("Analyze Position"):
@@ -485,7 +500,17 @@ def main():
         db_path = st.text_input("Database Path", value="training_logs.db")
         checkpoint_path = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
         
+        # Path validation
+        if not validate_path(db_path, [".db", ".sqlite", ".sqlite3"]):
+            st.error("Invalid database path. Must be a local file with .db, .sqlite or .sqlite3 extension.")
+            st.stop()
+
+        if not validate_path(checkpoint_path, [".pt", ".pth"]):
+            st.error("Invalid checkpoint path. Must be a local file with .pt or .pth extension.")
+            st.stop()
+
         auto_refresh = st.checkbox("Auto Refresh", value=False)
+        refresh_interval = 10
         if auto_refresh:
             refresh_interval = st.slider("Refresh Interval (s)", 5, 60, 10)
         
@@ -502,108 +527,117 @@ def main():
                 st.metric("Current Epoch", int(latest['epoch']))
                 st.metric("Latest Loss", f"{latest['loss_total']:.4f}")
                 st.metric("Top-1 Accuracy", f"{latest.get('accuracy_top1', 0)*100:.1f}%")
-        except:
+        except Exception:
             st.info("No training data yet")
     
     # Load model
     model, encoder, device = load_model(checkpoint_path)
     
     # Main tabs
-    tabs = st.tabs([
+    tab_titles = [
         "📈 Training", "🎯 MCTS", "♟️ Chess Performance",
         "💻 Hardware", "🎮 Play vs AI", "🔍 Analysis", "📥 Downloads"
-    ])
+    ]
+    tabs = st.tabs(tab_titles)
     
-    # Training tab
-    with tabs[0]:
-        st.header("Training Metrics")
-        try:
-            train_df = data_loader.get_training_metrics(limit=1000)
-            train_df = train_df.sort_values('epoch')
-            
-            plot_training_loss(train_df)
-            plot_accuracy(train_df)
-            
-            # Recent metrics table
-            st.subheader("Recent Metrics")
-            if not train_df.empty:
-                display_df = train_df[['epoch', 'loss_total', 'loss_policy', 'loss_value', 
-                                       'accuracy_top1', 'learning_rate']].head(10)
-                st.dataframe(display_df, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error loading training data: {e}")
-    
-    # MCTS tab
-    with tabs[1]:
-        st.header("MCTS Performance")
-        try:
-            mcts_df = data_loader.get_mcts_metrics(limit=1000)
-            mcts_df = mcts_df.sort_values('epoch')
-            plot_mcts_performance(mcts_df)
-        except Exception as e:
-            st.error(f"Error loading MCTS data: {e}")
-    
-    # Chess performance tab
-    with tabs[2]:
-        st.header("Chess Performance")
-        try:
-            chess_df = data_loader.get_chess_metrics(limit=1000)
-            chess_df = chess_df.sort_values('epoch')
-            plot_chess_performance(chess_df)
-        except Exception as e:
-            st.error(f"Error loading chess data: {e}")
-    
-    # Hardware tab
-    with tabs[3]:
-        st.header("Hardware Utilization")
-        try:
-            hw_df = data_loader.get_hardware_metrics(limit=1000)
-            hw_df = hw_df.sort_values('epoch')
-            plot_hardware_usage(hw_df)
-        except Exception as e:
-            st.error(f"Error loading hardware data: {e}")
-    
-    # Play vs AI tab
-    with tabs[4]:
-        play_vs_ai_tab(model, encoder, device)
-    
-    # Analysis tab
-    with tabs[5]:
-        position_analysis_tab(model, encoder, device)
-    
-    # Downloads tab
-    with tabs[6]:
-        st.header("📥 Downloads")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Model Checkpoints")
-            checkpoint_dir = Path("checkpoints")
-            if checkpoint_dir.exists():
-                checkpoints = list(checkpoint_dir.glob("*.pt"))
-                for cp in checkpoints:
-                    st.download_button(
-                        label=f"📦 {cp.name}",
-                        data=open(cp, "rb").read(),
-                        file_name=cp.name,
-                        mime="application/octet-stream"
-                    )
-        
-        with col2:
-            st.subheader("Game Records")
-            if st.button("Export Games to PGN"):
-                try:
-                    logger = MetricsLogger(db_path)
-                    logger.export_games_pgn("exported_games.pgn", limit=100)
-                    st.success("Games exported to exported_games.pgn")
-                except Exception as e:
-                    st.error(f"Export failed: {e}")
-    
+    with tabs[0]: render_training_tab(data_loader)
+    with tabs[1]: render_mcts_tab(data_loader)
+    with tabs[2]: render_chess_tab(data_loader)
+    with tabs[3]: render_hardware_tab(data_loader)
+    with tabs[4]: play_vs_ai_tab(model, encoder, device)
+    with tabs[5]: position_analysis_tab(model, encoder, device)
+    with tabs[6]: render_downloads_tab(db_path)
+
     # Auto refresh
     if auto_refresh:
         time.sleep(refresh_interval)
         st.rerun()
+
+
+def render_training_tab(data_loader):
+    st.header("Training Metrics")
+    try:
+        train_df = data_loader.get_training_metrics(limit=1000)
+        if not train_df.empty:
+            train_df = train_df.sort_values('epoch')
+            plot_training_loss(train_df)
+            plot_accuracy(train_df)
+            st.subheader("Recent Metrics")
+            cols = ['epoch', 'loss_total', 'loss_policy', 'loss_value', 'accuracy_top1', 'learning_rate']
+            display_df = train_df[cols].head(10)
+            st.dataframe(display_df, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error loading training data: {e}")
+
+
+def render_mcts_tab(data_loader):
+    st.header("MCTS Performance")
+    try:
+        mcts_df = data_loader.get_mcts_metrics(limit=1000)
+        if not mcts_df.empty:
+            mcts_df = mcts_df.sort_values('epoch')
+            plot_mcts_performance(mcts_df)
+    except Exception as e:
+        st.error(f"Error loading MCTS data: {e}")
+
+
+def render_chess_tab(data_loader):
+    st.header("Chess Performance")
+    try:
+        chess_df = data_loader.get_chess_metrics(limit=1000)
+        if not chess_df.empty:
+            chess_df = chess_df.sort_values('epoch')
+            plot_chess_performance(chess_df)
+    except Exception as e:
+        st.error(f"Error loading chess data: {e}")
+
+
+def render_hardware_tab(data_loader):
+    st.header("Hardware Utilization")
+    try:
+        hw_df = data_loader.get_hardware_metrics(limit=1000)
+        if not hw_df.empty:
+            hw_df = hw_df.sort_values('epoch')
+            plot_hardware_usage(hw_df)
+    except Exception as e:
+        st.error(f"Error loading hardware data: {e}")
+
+
+def render_downloads_tab(db_path):
+    st.header("📥 Downloads")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Model Checkpoints")
+        checkpoint_dir = Path("checkpoints")
+        if checkpoint_dir.exists():
+            checkpoints = list(checkpoint_dir.glob("*.pt"))
+            for cp in checkpoints:
+                try:
+                    with open(cp, "rb") as f:
+                        st.download_button(
+                            label=f"📦 {cp.name}",
+                            data=f.read(),
+                            file_name=cp.name,
+                            mime="application/octet-stream"
+                        )
+                except Exception as e:
+                    st.error(f"Could not read {cp.name}: {e}")
+    with col2:
+        st.subheader("Game Records")
+        if st.button("Export Games to PGN"):
+            try:
+                logger = MetricsLogger(db_path)
+                logger.export_games_pgn("exported_games.pgn", limit=100)
+                st.success("Games exported to exported_games.pgn")
+                with open("exported_games.pgn", "rb") as f:
+                    st.download_button(
+                        label="Download PGN",
+                        data=f.read(),
+                        file_name="exported_games.pgn",
+                        mime="text/plain"
+                    )
+            except Exception as e:
+                st.error(f"Export failed: {e}")
 
 
 if __name__ == "__main__":
