@@ -48,8 +48,6 @@ class StockfishDataset(Dataset):
                 self.priorities = np.ones(self.length, dtype=np.float32)
                 print(f"Loaded {self.length} positions from {h5_path} (min_eval={min_eval})")
 
-        self.file = None
-
     def update_priorities(self, indices, errors):
         """Update priorities for sampled indices based on TD-Error."""
         for idx, error in zip(indices, errors):
@@ -63,18 +61,17 @@ class StockfishDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        if self.file is None:
-            self.file = h5py.File(self.h5_path, 'r')
+        # Open HDF5 file in __getitem__ to be safe for multiprocessing
+        with h5py.File(self.h5_path, 'r') as f:
+            real_idx = self.indices[idx]
+            fen = f['fens'][real_idx]
+            if isinstance(fen, bytes):
+                fen = fen.decode('ascii')
 
-        real_idx = self.indices[idx]
-        fen = self.file['fens'][real_idx]
-        if isinstance(fen, bytes):
-            fen = fen.decode('ascii')
-
-        score = self.file['scores'][real_idx]
-        move_uci = self.file['moves'][real_idx]
-        if isinstance(move_uci, bytes):
-            move_uci = move_uci.decode('ascii')
+            score = f['scores'][real_idx]
+            move_uci = f['moves'][real_idx]
+            if isinstance(move_uci, bytes):
+                move_uci = move_uci.decode('ascii')
 
         board = chess.Board(fen)
         
@@ -97,29 +94,36 @@ class StockfishDataset(Dataset):
         return idx, image, policy_target, value_target
 
 
-class SelfPlayDataset(Dataset):
-    """Dataset for self-play positions."""
-    def __init__(self, positions):
-        self.positions = positions
+class CombinedDataset(Dataset):
+    """Dataset for mixing self-play positions and pre-encoded Stockfish data."""
+    def __init__(self, self_play_positions, stockfish_encoded_data):
+        self.self_play_positions = self_play_positions
+        self.stockfish_encoded_data = stockfish_encoded_data
         self.encoder = AlphaZeroEncoder()
         self.move_encoder = MoveEncoder()
+        self.sp_len = len(self_play_positions)
+        self.sf_len = len(stockfish_encoded_data)
 
     def __len__(self):
-        return len(self.positions)
+        return self.sp_len + self.sf_len
 
     def __getitem__(self, idx):
-        fen, policy_dict, value = self.positions[idx]
-        board = chess.Board(fen)
-        image = self.encoder.board_to_tensor(board)
+        if idx < self.sp_len:
+            fen, policy_dict, value = self.self_play_positions[idx]
+            board = chess.Board(fen)
+            image = self.encoder.board_to_tensor(board)
 
-        value_target = torch.tensor([value], dtype=torch.float32)
-        policy_target = torch.zeros(1968, dtype=torch.float32)
-        for move_uci, prob in policy_dict.items():
-            try:
-                move = chess.Move.from_uci(move_uci)
-                idx_m = self.move_encoder.move_to_index(move)
-                if idx_m != -1: policy_target[idx_m] = prob
-            except: pass
+            value_target = torch.tensor([value], dtype=torch.float32)
+            policy_target = torch.zeros(1968, dtype=torch.float32)
+            for move_uci, prob in policy_dict.items():
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    idx_m = self.move_encoder.move_to_index(move)
+                    if idx_m != -1: policy_target[idx_m] = prob
+                except: pass
+        else:
+            # Pre-encoded Stockfish data
+            image, policy_target, value_target = self.stockfish_encoded_data[idx - self.sp_len]
 
         return -1, image, policy_target, value_target # Return -1 for index since no PER here
 
@@ -247,11 +251,12 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # Calculate TD-Error for priorities
-            with torch.no_grad():
-                errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()) + \
-                         torch.abs(1.0 - torch.softmax(logits, dim=1)[range(len(logits)), policy_targets.argmax(dim=1)])
-                dataset.update_priorities(indices.numpy(), errors.cpu().numpy())
+            # Calculate TD-Error for priorities (only if dataset supports it)
+            if dataset is not None:
+                with torch.no_grad():
+                    errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()) + \
+                            torch.abs(1.0 - torch.softmax(logits, dim=1)[range(len(logits)), policy_targets.argmax(dim=1)])
+                    dataset.update_priorities(indices.numpy(), errors.cpu().numpy())
 
             total_loss += loss.item()
             acc = (logits.argmax(dim=1) == policy_targets.argmax(dim=1)).float().mean()
@@ -315,18 +320,19 @@ class Trainer:
             # 2. Training
             # Mix 80% self-play and 20% Stockfish data if available
             current_self_play_data = replay_buffer
+            sf_data = []
             if len(supervised_dataset) > 0:
-                # Sample some stockfish data
-                sf_indices = np.random.choice(len(supervised_dataset), size=len(current_self_play_data)//4)
-                sf_data = []
-                for idx in sf_indices:
-                    _, img, pol, val = supervised_dataset[idx]
-                    # Convert policy back to dict for SelfPlayDataset compatibility or just use it directly
-                    # Actually, better to just create a combined DataLoader
-                    sf_data.append((img, pol, val))
+                # Sample some stockfish data (20% of the total batch size essentially)
+                # To maintain 80/20 ratio: sf_count = len(self_play) / 4
+                sf_count = len(current_self_play_data) // 4
+                if sf_count > 0:
+                    sf_indices = np.random.choice(len(supervised_dataset), size=sf_count)
+                    for idx in sf_indices:
+                        _, img, pol, val = supervised_dataset[idx]
+                        sf_data.append((img, pol, val))
             
-            self_play_dataset = SelfPlayDataset(current_self_play_data)
-            loader = DataLoader(self_play_dataset, batch_size=64, shuffle=True)
+            combined_dataset = CombinedDataset(current_self_play_data, sf_data)
+            loader = DataLoader(combined_dataset, batch_size=64, shuffle=True)
             
             loss, acc = self.train_epoch(loader, None, epoch, temperature=0.5) # Sharpened T in RL
             
