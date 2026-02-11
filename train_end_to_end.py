@@ -67,10 +67,10 @@ class ChessDataset(Dataset):
         return graph_data, policy_target, value_target
 
 
+from torch_geometric.data import Batch as GeometricBatch
+
 def collate_fn(batch):
     """Custom collate function for graph data."""
-    from torch_geometric.data import Batch as GeometricBatch
-    
     graphs, policies, values = zip(*batch)
     
     # Batch graphs
@@ -103,21 +103,28 @@ class SelfPlayGenerator:
         
         move_count = 0
         while not board.is_game_over() and move_count < max_moves:
-            # Store position
-            fen = board.fen()
-            
-            # Run MCTS
-            move, stats = self.mcts.search(board, add_noise=(move_count < 30))
-            
-            # Get policy target from visit counts
-            policy_target = self.mcts.get_policy_target(stats.get('root_node'))
-            
-            # Store position (value will be filled at end)
-            positions.append((fen, policy_target, 0.0))
-            
-            # Make move
-            board.push(move)
-            move_count += 1
+            try:
+                # Store position
+                fen = board.fen()
+
+                # Run MCTS
+                move, stats = self.mcts.search(board, add_noise=(move_count < 30))
+
+                # Get policy target from visit counts
+                policy_target = stats.get('policy_target')
+                if not policy_target:
+                    # Fallback or break
+                    break
+
+                # Store position (value will be filled at end)
+                positions.append((fen, policy_target, 0.0))
+
+                # Make move
+                board.push(move)
+                move_count += 1
+            except Exception as e:
+                print(f"Error during self-play: {e}")
+                break
         
         # Determine game outcome
         result = board.result()
@@ -220,17 +227,20 @@ class Trainer:
             print("[Checkpoint] No checkpoint found, starting from scratch")
             return
         
-        print(f"[Checkpoint] Loading from {latest_path}")
-        checkpoint = torch.load(latest_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.current_epoch = checkpoint['epoch']
-        self.global_step = checkpoint['global_step']
-        self.best_loss = checkpoint['best_loss']
-        
-        print(f"[Checkpoint] Resumed from epoch {self.current_epoch}")
+        try:
+            print(f"[Checkpoint] Loading from {latest_path}")
+            # Use weights_only=True if available in future torch versions for security
+            checkpoint = torch.load(latest_path, map_location=self.device)
+
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.current_epoch = checkpoint['epoch']
+            self.global_step = checkpoint['global_step']
+            self.best_loss = checkpoint['best_loss']
+            print(f"[Checkpoint] Resumed from epoch {self.current_epoch}")
+        except Exception as e:
+            print(f"[Checkpoint] Error loading checkpoint: {e}")
     
     def train_epoch(self, dataloader: DataLoader, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
@@ -428,7 +438,7 @@ class Trainer:
                 batch_size=batch_size,
                 shuffle=True,
                 collate_fn=collate_fn,
-                num_workers=0  # Set to 0 for compatibility
+                num_workers=max(0, os.cpu_count() // 2) if sys.platform != 'win32' else 0
             )
             
             # Train epoch

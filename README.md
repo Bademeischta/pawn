@@ -23,8 +23,8 @@
 - **Self-play training** with AlphaZero-style reinforcement learning
 
 ### 📊 Comprehensive Metrics & Monitoring
-- **Asynchronous SQLite logging** for zero-overhead metrics collection
-- **Real-time dashboard** with Streamlit and ngrok support
+- **Asynchronous SQLite logging** with parameterized queries for security
+- **Real-time dashboard** with Streamlit, ngrok support, and secure file handling
 - **Training metrics**: Loss, accuracy, learning rate, gradient norms
 - **MCTS metrics**: Search depth, nodes/second, cache hit rate, Q-values
 - **Chess metrics**: Elo estimation, win/loss/draw rates, game analysis
@@ -158,7 +158,7 @@ Graph Attention Networks (4 layers, 8 heads)
     ↓
 Attention-based Pooling
     ↓
-    ├─→ Policy Head → Move probabilities (1968 outputs)
+    ├─→ Policy Head → Move probabilities (16384 outputs, collision-free)
     └─→ Value Head → Position evaluation [-1, 1]
 ```
 
@@ -166,36 +166,20 @@ Attention-based Pooling
 - **Node Features** (15 dims): Piece type, color, position, mobility, attack/defense status, material value, king distances
 - **Edge Features** (3 dims): Attack/defense relationships, distance
 - **Global Features** (7 dims): Turn, castling rights, move counters
-- **Parameters**: ~2-5M (configurable)
+- **Parameters**: ~5-6M (optimized)
 
 ### MCTS Algorithm
 
 ```python
 for simulation in range(num_simulations):
-    node = root
-    
-    # Selection: Navigate tree using PUCT
-    while node.is_expanded:
-        node = select_child(node, c_puct=1.4)
-    
-    # Expansion: Add children with NN priors
-    if not node.is_terminal:
-        policy, value = neural_network(node.position)
-        expand(node, policy)
-    
+    # Selection: Navigate tree using PUCT (optimized with push/pop)
+    # Expansion: Add children with NN priors (collision-free move encoding)
     # Evaluation: Get value from NN
-    value = neural_network(node.position).value
-    
     # Backpropagation: Update statistics
-    while node is not None:
-        node.visits += 1
-        node.total_value += value
-        value = -value  # Flip for opponent
-        node = node.parent
 ```
 
 **Optimizations:**
-- **Transposition Table**: Cache evaluated positions (1M entries)
+- **Transposition Table**: Cache evaluated positions (1M entries, LRU eviction)
 - **Dirichlet Noise**: Add exploration in root (α=0.3, ε=0.25)
 - **Temperature Sampling**: Control move selection randomness
 - **Parallel Evaluation**: Batch NN inference

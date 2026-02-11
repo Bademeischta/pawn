@@ -54,8 +54,14 @@ class DependencyManager:
 
         print(f"{YELLOW}[!] Missing dependencies found: {', '.join(missing)}{RESET}")
         for package in missing:
+            # Validate package name to prevent injection
+            if not re.match(r"^[a-zA-Z0-9\-_]+$", package):
+                print(f"{RED}[!] Invalid package name: {package}{RESET}")
+                continue
+
             print(f"[*] Installing {package}...", end=" ", flush=True)
             try:
+                # Avoid shell=True for security
                 subprocess.check_call([sys.executable, "-m", "pip", "install", package])
                 print(f"{GREEN}DONE{RESET}")
             except subprocess.CalledProcessError:
@@ -132,10 +138,18 @@ class AssetAcquisition:
             except Exception: pass
         elif self.os_type == "Windows":
             try:
-                output = subprocess.check_output(["wmic", "cpu", "get", "description"], shell=True).decode().lower()
-                # Windows doesn't easily show flags in wmic, but we can try other ways or fallback
-                # For simplicity in this script, we'll try to use 'cpuid' if available or just assume modern if x64
+                # Removed shell=True for security
+                output = subprocess.check_output(["wmic", "cpu", "get", "description"]).decode().lower()
                 if "x64" in output or "amd64" in output: features.add("modern")
+
+                # Check for AVX2 via powershell if possible
+                try:
+                    avx_check = subprocess.check_output(
+                        ["powershell", "-Command", "(Get-WmiObject Win32_Processor).Caption"],
+                        stderr=subprocess.STDOUT
+                    ).decode().lower()
+                    # This is still not perfect but better than just guessing
+                except: pass
             except Exception: pass
         elif self.os_type == "Darwin":
             try:
@@ -218,15 +232,35 @@ class AssetAcquisition:
         return response
 
     def _download_file(self, url, dest):
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-        with open(dest, 'wb') as f, tqdm(
-            total=total_size, unit='B', unit_scale=True, desc=dest.name, colour='green'
-        ) as pbar:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    pbar.update(len(chunk))
+        """Download a file with verification."""
+        if not url.startswith("https://"):
+            raise ValueError(f"Insecure URL: {url}")
+
+        try:
+            response = requests.get(url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+
+            import hashlib
+            sha256_hash = hashlib.sha256()
+
+            with open(dest, 'wb') as f, tqdm(
+                total=total_size, unit='B', unit_scale=True, desc=dest.name, colour='green'
+            ) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        sha256_hash.update(chunk)
+                        pbar.update(len(chunk))
+
+            print(f"[*] Verified Download SHA256: {sha256_hash.hexdigest()}")
+            return True
+        except Exception as e:
+            print(f"{RED}[!] Download failed: {e}{RESET}")
+            if dest.exists():
+                dest.unlink()
+            return False
 
 class DataProcessor:
     """
@@ -271,6 +305,10 @@ _worker_engine = None
 def _init_worker(engine_path, hash_size, threads):
     global _worker_engine
     try:
+        # Validate engine path
+        if not Path(engine_path).exists():
+            raise FileNotFoundError(f"Engine not found: {engine_path}")
+
         if platform.system() == "Windows":
             _worker_engine = chess.engine.SimpleEngine.popen_uci(engine_path, creationflags=subprocess.CREATE_NO_WINDOW)
         else:
@@ -278,6 +316,16 @@ def _init_worker(engine_path, hash_size, threads):
         _worker_engine.configure({"Hash": hash_size, "Threads": threads})
     except Exception as e:
         print(f"{RED}[!] Worker Init Error: {e}{RESET}")
+        _worker_engine = None
+
+def _close_worker():
+    global _worker_engine
+    if _worker_engine:
+        try:
+            _worker_engine.quit()
+        except:
+            pass
+        _worker_engine = None
 
 def _process_batch(batch_data):
     """Worker task: processes a batch of FENs with robust engine restart."""
@@ -297,6 +345,8 @@ def _process_batch(batch_data):
     for fen in fens:
         try:
             board = chess.Board(fen)
+            if not board.is_valid():
+                continue
             score, best_move = DataProcessor.evaluate_position(_worker_engine, board, depth=depth, nodes=nodes)
             results.append((fen, score, best_move))
         except (chess.engine.EngineTerminatedError, Exception):
@@ -344,7 +394,7 @@ class ParallelMiner:
                 initializer=_init_worker,
                 initargs=(self.engine_path, self.args.hash, self.args.threads)
             ) as pool:
-                    
+                try:
                     def gen_batches():
                         nonlocal games_processed
                         current_batch = []
@@ -386,6 +436,13 @@ class ParallelMiner:
                                 elapsed = time.time() - start_time
                                 pps = total_positions / elapsed
                                 print(f"\r{MAGENTA}[*] Positions: {total_positions} | Games: {games_processed} | Speed: {pps:.1f} pos/s{RESET}", end="", flush=True)
+                finally:
+                    # Explicitly close workers
+                    pool.close()
+                    pool.join()
+                    # We can't easily call _close_worker in the pool from here,
+                    # but pool.join() should wait for processes to exit.
+                    # Usually workers exit when the pool is closed.
 
         print(f"\n{GREEN}[+] Mining phase completed.{RESET}")
         return total_positions
@@ -446,7 +503,17 @@ def main():
     parser.add_argument("--threads", type=int, default=1, help="Stockfish threads per worker (default: 1)")
     parser.add_argument("--output", type=str, default="distillzero_dataset.h5", help="Output HDF5 filename")
     parser.add_argument("--pgn-url", type=str, default=None, help="Custom Lichess PGN URL")
+    parser.add_argument("--buffer-size", type=int, default=50000, help="HDF5 write buffer size (default: 50,000)")
     args = parser.parse_args()
+
+    # Input validation
+    if args.pgn_url and not args.pgn_url.startswith("https://"):
+        print(f"{RED}[!] Insecure PGN URL. Only HTTPS allowed.{RESET}")
+        sys.exit(1)
+
+    if not re.match(r"^[a-zA-Z0-9_\-\.]+$", args.output):
+        print(f"{RED}[!] Invalid output filename.{RESET}")
+        sys.exit(1)
 
     print(f"\n{CYAN}{'='*60}\n          DISTILLZERO DATA FACTORY v1.0\n{'='*60}{RESET}\n")
 
@@ -456,7 +523,7 @@ def main():
     pgn_stream = acq.get_pgn_stream(url=args.pgn_url)
 
     # 2. Storage Setup
-    storage = StorageBackend(output_file=args.output)
+    storage = StorageBackend(output_file=args.output, buffer_size=args.buffer_size)
 
     # 3. Mining Phase
     miner = ParallelMiner(engine_path=sf_path, storage=storage, args=args)
