@@ -347,7 +347,18 @@ def _process_batch(batch_data):
             board = chess.Board(fen)
             if not board.is_valid():
                 continue
+
+            # Analyze position type for balancing (basic heuristic)
+            is_sharp = board.is_check() or any(board.is_capture(m) for m in board.legal_moves)
+
             score, best_move = DataProcessor.evaluate_position(_worker_engine, board, depth=depth, nodes=nodes)
+
+            # Filter: Skip positions with Stockfish Eval between -0.3 and +0.3 (langweilige Remis)
+            if -0.3 < score < 0.3:
+                # Keep only 10% of "boring" draws
+                if not is_sharp and np.random.random() > 0.1:
+                    continue
+
             results.append((fen, score, best_move))
         except (chess.engine.EngineTerminatedError, Exception):
             # Attempt to restart engine once on error
@@ -410,10 +421,19 @@ class ParallelMiner:
                             if game is None: break
 
                             board = game.board()
+                            # Filter by Rating (>= 2000 ELO)
+                            white_elo = game.headers.get("WhiteElo", "0")
+                            black_elo = game.headers.get("BlackElo", "0")
+                            try:
+                                if int(white_elo) < 2000 and int(black_elo) < 2000:
+                                    continue
+                            except ValueError:
+                                continue
+
                             for i, move in enumerate(game.mainline_moves()):
                                 board.push(move)
-                                # Skip opening theory (first 20 plies = 10 full moves)
-                                if i >= 20:
+                                # Sample positions from moves 15-60 (Mittelspiel)
+                                if 30 <= i <= 120: # 30 plies = move 15
                                     current_batch.append(board.fen())
                                     if len(current_batch) >= 100:
                                         yield (current_batch, self.args.depth, self.args.nodes,

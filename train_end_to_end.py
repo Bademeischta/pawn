@@ -1,533 +1,351 @@
 """
-Archimedes Chess AI - End-to-End Training Script
-Robust, resumable training with automatic checkpointing and comprehensive metrics.
+DistillZero - Training Pipeline
+Two-phase training: Supervised Knowledge Distillation -> Reinforcement Learning Finetuning.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import h5py
 import chess
-import chess.pgn
+import chess.engine
 import numpy as np
-import time
 import os
-import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import argparse
 from tqdm import tqdm
-import io
 
-from model import ArchimedesGNN, ChessBoardEncoder, MoveEncoder
+from model import ChessResNet, AlphaZeroEncoder, MoveEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
 
 
-class ChessDataset(Dataset):
-    """Dataset for chess positions with policy and value targets."""
-    
-    def __init__(self, positions: List[Tuple[str, Dict[str, float], float]]):
-        """
-        Args:
-            positions: List of (fen, policy_dict, value) tuples
-        """
-        self.positions = positions
-        self.encoder = ChessBoardEncoder()
+class StockfishDataset(Dataset):
+    """
+    Dataset loading from HDF5 file with Prioritized Experience Replay support.
+    """
+    def __init__(self, h5_path: str, min_eval: float = 0.0, alpha: float = 0.6):
+        self.h5_path = h5_path
+        self.min_eval = min_eval
+        self.alpha = alpha
+        self.encoder = AlphaZeroEncoder()
         self.move_encoder = MoveEncoder()
-    
+
+        if not os.path.exists(h5_path):
+            self.indices = []
+            self.length = 0
+            self.priorities = np.array([])
+        else:
+            with h5py.File(self.h5_path, 'r') as f:
+                scores = f['scores'][:]
+                self.indices = np.where(np.abs(scores) >= min_eval)[0]
+                self.length = len(self.indices)
+                # Initialize priorities with 1.0 (uniform at start)
+                self.priorities = np.ones(self.length, dtype=np.float32)
+                print(f"Loaded {self.length} positions from {h5_path} (min_eval={min_eval})")
+
+        self.file = None
+
+    def update_priorities(self, indices, errors):
+        """Update priorities for sampled indices based on TD-Error."""
+        for idx, error in zip(indices, errors):
+            self.priorities[idx] = (error + 1e-5) ** self.alpha
+
+    def get_sampling_probabilities(self):
+        """Get probabilities proportional to priorities."""
+        return self.priorities / self.priorities.sum()
+
     def __len__(self):
-        return len(self.positions)
-    
+        return self.length
+
     def __getitem__(self, idx):
-        fen, policy_dict, value = self.positions[idx]
-        
-        # Create board
+        if self.file is None:
+            self.file = h5py.File(self.h5_path, 'r')
+
+        real_idx = self.indices[idx]
+        fen = self.file['fens'][real_idx]
+        if isinstance(fen, bytes):
+            fen = fen.decode('ascii')
+
+        score = self.file['scores'][real_idx]
+        move_uci = self.file['moves'][real_idx]
+        if isinstance(move_uci, bytes):
+            move_uci = move_uci.decode('ascii')
+
         board = chess.Board(fen)
         
-        # Encode as graph
-        graph_data = self.encoder.board_to_graph(board)
+        # Encode board
+        image = self.encoder.board_to_tensor(board)
         
-        # Create policy target (sparse)
-        policy_target = torch.zeros(1968)
+        # Value target: Stockfish score
+        value_target = torch.tensor([score], dtype=torch.float32)
+        
+        # Policy target: 1.0 for the best move
+        policy_target = torch.zeros(1968, dtype=torch.float32)
+        try:
+            move = chess.Move.from_uci(move_uci)
+            move_idx = self.move_encoder.move_to_index(move)
+            if move_idx != -1:
+                policy_target[move_idx] = 1.0
+        except:
+            pass
+
+        return idx, image, policy_target, value_target
+
+
+class SelfPlayDataset(Dataset):
+    """Dataset for self-play positions."""
+    def __init__(self, positions):
+        self.positions = positions
+        self.encoder = AlphaZeroEncoder()
+        self.move_encoder = MoveEncoder()
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getitem__(self, idx):
+        fen, policy_dict, value = self.positions[idx]
+        board = chess.Board(fen)
+        image = self.encoder.board_to_tensor(board)
+
+        value_target = torch.tensor([value], dtype=torch.float32)
+        policy_target = torch.zeros(1968, dtype=torch.float32)
         for move_uci, prob in policy_dict.items():
             try:
                 move = chess.Move.from_uci(move_uci)
-                move_idx = self.move_encoder.move_to_index(move)
-                policy_target[move_idx] = prob
-            except:
-                pass
-        
-        # Normalize policy target
-        if policy_target.sum() > 0:
-            policy_target = policy_target / policy_target.sum()
-        
-        value_target = torch.tensor([value], dtype=torch.float32)
-        
-        return graph_data, policy_target, value_target
+                idx_m = self.move_encoder.move_to_index(move)
+                if idx_m != -1: policy_target[idx_m] = prob
+            except: pass
 
-
-from torch_geometric.data import Batch as GeometricBatch
-
-def collate_fn(batch):
-    """Custom collate function for graph data."""
-    graphs, policies, values = zip(*batch)
-    
-    # Batch graphs
-    batched_graphs = GeometricBatch.from_data_list(graphs)
-    
-    # Stack policies and values
-    policies = torch.stack(policies)
-    values = torch.stack(values)
-    
-    return batched_graphs, policies, values
-
+        return -1, image, policy_target, value_target # Return -1 for index since no PER here
 
 class SelfPlayGenerator:
-    """Generates training data through self-play."""
+    """Generates training data through self-play with curriculum."""
     
     def __init__(self, model, encoder, mcts_simulations: int = 400):
         self.model = model
         self.encoder = encoder
         self.mcts = MCTS(model, encoder, num_simulations=mcts_simulations)
     
-    def generate_game(self, max_moves: int = 200) -> List[Tuple[str, Dict[str, float], float]]:
-        """
-        Play one game and return training positions.
-        
-        Returns:
-            List of (fen, policy_target, value) tuples
-        """
+    def generate_game(self, opponent_engine=None, max_moves: int = 200) -> List[Tuple[str, Dict[str, float], float]]:
         board = chess.Board()
         positions = []
         
         move_count = 0
         while not board.is_game_over() and move_count < max_moves:
-            try:
-                # Store position
-                fen = board.fen()
+            fen = board.fen()
 
-                # Run MCTS
-                move, stats = self.mcts.search(board, add_noise=(move_count < 30))
+            # In Phase 2, we generate data for both sides to learn from
+            move, stats = self.mcts.search(board, add_noise=(move_count < 30))
+            policy_target = stats.get('policy_target')
+            if not policy_target: break
 
-                # Get policy target from visit counts
-                policy_target = stats.get('policy_target')
-                if not policy_target:
-                    # Fallback or break
-                    break
+            # Store position and MCTS policy
+            positions.append([fen, policy_target, 0.0, board.turn])
 
-                # Store position (value will be filled at end)
-                positions.append((fen, policy_target, 0.0))
+            # If opponent engine is provided, it can override MCTS for its turn
+            # but we still recorded our MCTS policy for that position if we wanted to learn it.
+            # Actually, better to only learn from MCTS if it's the one playing.
+            if opponent_engine and board.turn == chess.BLACK:
+                result = opponent_engine.play(board, chess.engine.Limit(time=0.01))
+                move = result.move
 
-                # Make move
-                board.push(move)
-                move_count += 1
-            except Exception as e:
-                print(f"Error during self-play: {e}")
-                break
+            board.push(move)
+            move_count += 1
         
-        # Determine game outcome
         result = board.result()
-        if result == "1-0":
-            final_value = 1.0
-        elif result == "0-1":
-            final_value = -1.0
-        else:
-            final_value = 0.0
+        if result == "1-0": final_v = 1.0
+        elif result == "0-1": final_v = -1.0
+        else: final_v = 0.0
         
         # Assign values from perspective of player to move
-        for i, (fen, policy, _) in enumerate(positions):
-            # Alternate perspective
-            value = final_value if i % 2 == 0 else -final_value
-            positions[i] = (fen, policy, value)
-        
-        return positions, board
-    
-    def generate_batch(self, num_games: int = 10) -> List[Tuple[str, Dict[str, float], float]]:
-        """Generate multiple games."""
-        all_positions = []
-        
-        for _ in tqdm(range(num_games), desc="Self-play"):
-            positions, _ = self.generate_game()
-            all_positions.extend(positions)
-        
-        return all_positions
+        processed = []
+        for fen, policy, _, turn in positions:
+            v = final_v if turn == chess.WHITE else -final_v
+            processed.append((fen, policy, v))
+
+        return processed
+
+
+class OpponentScheduler:
+    """Milestone-based Stockfish levels."""
+    def __init__(self, sf_path: str):
+        self.sf_path = sf_path
+        self.levels = {
+            (0, 15): 1,   # Rating ~1350
+            (16, 40): 5,  # Rating ~1800
+            (41, 1000): 10 # Rating ~2200
+        }
+
+    def get_level(self, epoch: int) -> int:
+        for (start, end), level in self.levels.items():
+            if start <= epoch <= end:
+                return level
+        return 10
+
+    def get_engine(self, epoch: int):
+        level = self.get_level(epoch)
+        engine = chess.engine.SimpleEngine.popen_uci(self.sf_path)
+        engine.configure({"Skill Level": level})
+        return engine
 
 
 class Trainer:
-    """Main training orchestrator with checkpointing and metrics."""
+    """Two-Phase Trainer with AMP and Distillation Loss."""
     
     def __init__(self, 
                  model: nn.Module,
                  device: torch.device,
-                 learning_rate: float = 0.001,
-                 weight_decay: float = 1e-4,
                  checkpoint_dir: str = "checkpoints"):
-        
         self.model = model.to(device)
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
-        
-        # Optimizer and scheduler
-        self.optimizer = optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
-        
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=10,
-            T_mult=2
-        )
-        
-        # Metrics logger
+        self.scaler = torch.cuda.amp.GradScaler()
         self.metrics_logger = MetricsLogger()
         
-        # Training state
+        self.optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
+
         self.current_epoch = 0
         self.best_loss = float('inf')
-        self.global_step = 0
-        
-        # Load checkpoint if exists
-        self.load_checkpoint()
-    
-    def save_checkpoint(self, is_best: bool = False):
-        """Save training checkpoint."""
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_loss': self.best_loss,
-        }
-        
-        # Save latest checkpoint
-        latest_path = self.checkpoint_dir / "latest_checkpoint.pt"
-        torch.save(checkpoint, latest_path)
-        print(f"[Checkpoint] Saved to {latest_path}")
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = self.checkpoint_dir / "best_checkpoint.pt"
-            torch.save(checkpoint, best_path)
-            print(f"[Checkpoint] New best model saved to {best_path}")
-        
-        # Save epoch checkpoint
-        epoch_path = self.checkpoint_dir / f"checkpoint_epoch_{self.current_epoch}.pt"
-        torch.save(checkpoint, epoch_path)
-    
-    def load_checkpoint(self):
-        """Load checkpoint if exists."""
-        latest_path = self.checkpoint_dir / "latest_checkpoint.pt"
-        
-        if not latest_path.exists():
-            print("[Checkpoint] No checkpoint found, starting from scratch")
-            return
-        
-        try:
-            print(f"[Checkpoint] Loading from {latest_path}")
-            # Use weights_only=True if available in future torch versions for security
-            checkpoint = torch.load(latest_path, map_location=self.device)
 
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.current_epoch = checkpoint['epoch']
-            self.global_step = checkpoint['global_step']
-            self.best_loss = checkpoint['best_loss']
-            print(f"[Checkpoint] Resumed from epoch {self.current_epoch}")
-        except Exception as e:
-            print(f"[Checkpoint] Error loading checkpoint: {e}")
-    
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> Dict[str, float]:
-        """Train for one epoch."""
+    def distillation_loss(self, logits, targets, value_pred, value_targets, temperature=2.0):
+        # Soft Teacher Distribution
+        with torch.no_grad():
+            soft_targets = targets ** (1.0 / temperature)
+            soft_targets = soft_targets / (soft_targets.sum(dim=1, keepdim=True) + 1e-8)
+        
+        soft_logits = F.log_softmax(logits / temperature, dim=1)
+        kl_loss = F.kl_div(soft_logits, soft_targets, reduction='batchmean')
+        ce_loss = F.cross_entropy(logits, targets.argmax(dim=1))
+        
+        policy_loss = 0.7 * kl_loss * (temperature ** 2) + 0.3 * ce_loss
+        value_loss = F.mse_loss(value_pred, value_targets)
+        
+        return 0.7 * policy_loss + 0.3 * value_loss, policy_loss, value_loss
+
+    def train_epoch(self, dataloader, dataset, epoch, temperature=2.0):
         self.model.train()
-        
-        total_loss = 0.0
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_correct_top1 = 0
-        total_correct_top5 = 0
-        total_samples = 0
-        
-        epoch_start = time.time()
+        total_loss = 0
+        total_acc = 0
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-        for batch_idx, (graphs, policy_targets, value_targets) in enumerate(pbar):
-            # Move to device
-            graphs = graphs.to(self.device)
-            policy_targets = policy_targets.to(self.device)
-            value_targets = value_targets.to(self.device)
+        for indices, images, policy_targets, value_targets in dataloader:
+            images, policy_targets, value_targets = images.to(self.device), policy_targets.to(self.device), value_targets.to(self.device)
             
-            # Forward pass
-            policy_logits, value_pred, aux = self.model(graphs)
-            
-            # Compute losses
-            policy_loss = F.cross_entropy(policy_logits, policy_targets)
-            value_loss = F.mse_loss(value_pred, value_targets)
-            
-            # Combined loss
-            loss = policy_loss + value_loss
-            
-            # Backward pass
             self.optimizer.zero_grad()
-            loss.backward()
+            with torch.cuda.amp.autocast():
+                logits, value_pred = self.model(images)
+                loss, p_loss, v_loss = self.distillation_loss(logits, policy_targets, value_pred, value_targets, temperature)
             
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             
-            self.optimizer.step()
+            # Calculate TD-Error for priorities
+            with torch.no_grad():
+                errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()) + \
+                         torch.abs(1.0 - torch.softmax(logits, dim=1)[range(len(logits)), policy_targets.argmax(dim=1)])
+                dataset.update_priorities(indices.numpy(), errors.cpu().numpy())
+
+            total_loss += loss.item()
+            acc = (logits.argmax(dim=1) == policy_targets.argmax(dim=1)).float().mean()
+            total_acc += acc.item()
             
-            # Metrics
-            batch_size = policy_targets.size(0)
-            total_samples += batch_size
-            total_loss += loss.item() * batch_size
-            total_policy_loss += policy_loss.item() * batch_size
-            total_value_loss += value_loss.item() * batch_size
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{acc.item():.2%}"})
             
-            # Top-k accuracy
-            _, top5_pred = policy_logits.topk(5, dim=1)
-            _, top1_pred = policy_logits.topk(1, dim=1)
-            _, targets = policy_targets.topk(1, dim=1)
-            
-            total_correct_top1 += (top1_pred == targets).sum().item()
-            total_correct_top5 += (top5_pred == targets.expand_as(top5_pred)).any(dim=1).sum().item()
-            
-            # Log batch metrics
-            if batch_idx % 10 == 0:
-                self.metrics_logger.log_training(
-                    epoch=epoch,
-                    batch=batch_idx,
-                    metrics={
-                        'loss_total': loss.item(),
-                        'loss_policy': policy_loss.item(),
-                        'loss_value': value_loss.item(),
-                        'learning_rate': self.optimizer.param_groups[0]['lr'],
-                        'gradient_norm': grad_norm.item(),
-                    }
-                )
+        return total_loss / len(dataloader), total_acc / len(dataloader)
+
+    def save_checkpoint(self, name):
+        torch.save({
+            'epoch': self.current_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, self.checkpoint_dir / f"{name}.pt")
+
+    def train(self, h5_path, sf_path, num_epochs=100):
+        # Phase 1: Supervised Distillation
+        print("--- PHASE 1: Supervised Distillation ---")
+        supervised_dataset = StockfishDataset(h5_path, min_eval=0.7)
+        if len(supervised_dataset) > 0:
+            for epoch in range(50):
+                self.current_epoch = epoch
+                probs = supervised_dataset.get_sampling_probabilities()
+                sampler = torch.utils.data.WeightedRandomSampler(probs, num_samples=len(supervised_dataset), replacement=True)
+                loader = DataLoader(supervised_dataset, batch_size=64, sampler=sampler, num_workers=4)
                 
-                # Log hardware metrics
-                if batch_idx % 50 == 0:
-                    self.metrics_logger.log_hardware(epoch)
+                temp = max(0.5, 2.0 - (epoch / 50) * 1.5)
+                loss, acc = self.train_epoch(loader, supervised_dataset, epoch, temperature=temp)
+                self.save_checkpoint("latest")
+                if acc > 0.55:
+                    print(f"Target accuracy {acc:.2%} reached. Ending Supervised Phase.")
+                    break
+        
+        # Phase 2: Self-Play Finetuning
+        print("--- PHASE 2: Self-Play Finetuning ---")
+        if not os.path.exists(sf_path):
+            print(f"Warning: Stockfish not found at {sf_path}. Skipping Phase 2 or playing without engine.")
+            scheduler = None
+        else:
+            scheduler = OpponentScheduler(sf_path)
             
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'policy': f"{policy_loss.item():.4f}",
-                'value': f"{value_loss.item():.4f}",
-            })
-            
-            self.global_step += 1
+        encoder = AlphaZeroEncoder()
+        generator = SelfPlayGenerator(self.model, encoder)
+        replay_buffer = []
         
-        epoch_duration = time.time() - epoch_start
-        
-        # Compute epoch metrics
-        avg_loss = total_loss / total_samples
-        avg_policy_loss = total_policy_loss / total_samples
-        avg_value_loss = total_value_loss / total_samples
-        acc_top1 = total_correct_top1 / total_samples
-        acc_top5 = total_correct_top5 / total_samples
-        
-        # Get model weight statistics
-        weights = []
-        for param in self.model.parameters():
-            weights.append(param.data.cpu().numpy().flatten())
-        weights = np.concatenate(weights)
-        
-        # Log epoch metrics
-        self.metrics_logger.log_training(
-            epoch=epoch,
-            batch=-1,  # Epoch summary
-            metrics={
-                'loss_total': avg_loss,
-                'loss_policy': avg_policy_loss,
-                'loss_value': avg_value_loss,
-                'learning_rate': self.optimizer.param_groups[0]['lr'],
-                'accuracy_top1': acc_top1,
-                'accuracy_top5': acc_top5,
-                'epoch_duration': epoch_duration,
-                'samples_trained': total_samples,
-                'weight_mean': float(weights.mean()),
-                'weight_std': float(weights.std()),
-            }
-        )
-        
-        return {
-            'loss': avg_loss,
-            'policy_loss': avg_policy_loss,
-            'value_loss': avg_value_loss,
-            'acc_top1': acc_top1,
-            'acc_top5': acc_top5,
-        }
-    
-    def evaluate(self, num_games: int = 10) -> Dict[str, float]:
-        """Evaluate model through self-play."""
-        self.model.eval()
-        
-        encoder = ChessBoardEncoder()
-        mcts = MCTS(self.model, encoder, num_simulations=200)
-        
-        results = {'wins': 0, 'losses': 0, 'draws': 0}
-        game_lengths = []
-        
-        for _ in tqdm(range(num_games), desc="Evaluation"):
-            board = chess.Board()
-            move_count = 0
-            
-            while not board.is_game_over() and move_count < 200:
-                move, _ = mcts.search(board, add_noise=False)
-                board.push(move)
-                move_count += 1
-            
-            result = board.result()
-            if result == "1-0":
-                results['wins'] += 1
-            elif result == "0-1":
-                results['losses'] += 1
-            else:
-                results['draws'] += 1
-            
-            game_lengths.append(move_count)
-        
-        # Calculate metrics
-        total_games = num_games
-        win_rate = results['wins'] / total_games
-        loss_rate = results['losses'] / total_games
-        draw_rate = results['draws'] / total_games
-        avg_game_length = np.mean(game_lengths)
-        
-        # Estimate Elo (simplified)
-        elo_estimate = 1500 + 400 * np.log10(max(win_rate / max(loss_rate, 0.01), 0.01))
-        
-        return {
-            'win_rate': win_rate,
-            'loss_rate': loss_rate,
-            'draw_rate': draw_rate,
-            'avg_game_length': avg_game_length,
-            'elo_estimate': elo_estimate,
-        }
-    
-    def train(self, num_epochs: int, games_per_epoch: int = 100, batch_size: int = 32):
-        """Main training loop."""
-        print(f"\n{'='*60}")
-        print(f"  ARCHIMEDES TRAINING - Starting from Epoch {self.current_epoch}")
-        print(f"{'='*60}\n")
-        
-        encoder = ChessBoardEncoder()
-        
-        for epoch in range(self.current_epoch, num_epochs):
+        for epoch in range(self.current_epoch + 1, num_epochs):
             self.current_epoch = epoch
+            engine = scheduler.get_engine(epoch) if scheduler else None
             
-            print(f"\n[Epoch {epoch+1}/{num_epochs}]")
+            # 1. Data Generation
+            print(f"Generating self-play games...")
+            new_positions = []
+            for _ in tqdm(range(10), desc="Games"): # 10 games per epoch
+                new_positions.extend(generator.generate_game(opponent_engine=engine))
+            if engine: engine.quit()
             
-            # Generate self-play data
-            print("Generating self-play data...")
-            generator = SelfPlayGenerator(self.model, encoder, mcts_simulations=400)
-            positions = generator.generate_batch(num_games=games_per_epoch)
+            replay_buffer.extend(new_positions)
+            if len(replay_buffer) > 20000: replay_buffer = replay_buffer[-20000:]
             
-            print(f"Generated {len(positions)} training positions")
+            # 2. Training
+            # Mix 80% self-play and 20% Stockfish data if available
+            current_self_play_data = replay_buffer
+            if len(supervised_dataset) > 0:
+                # Sample some stockfish data
+                sf_indices = np.random.choice(len(supervised_dataset), size=len(current_self_play_data)//4)
+                sf_data = []
+                for idx in sf_indices:
+                    _, img, pol, val = supervised_dataset[idx]
+                    # Convert policy back to dict for SelfPlayDataset compatibility or just use it directly
+                    # Actually, better to just create a combined DataLoader
+                    sf_data.append((img, pol, val))
             
-            # Create dataset and dataloader
-            dataset = ChessDataset(positions)
-            dataloader = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                collate_fn=collate_fn,
-                num_workers=max(0, os.cpu_count() // 2) if sys.platform != 'win32' else 0
-            )
+            self_play_dataset = SelfPlayDataset(current_self_play_data)
+            loader = DataLoader(self_play_dataset, batch_size=64, shuffle=True)
             
-            # Train epoch
-            train_metrics = self.train_epoch(dataloader, epoch)
+            loss, acc = self.train_epoch(loader, None, epoch, temperature=0.5) # Sharpened T in RL
             
-            # Update learning rate
-            self.scheduler.step()
-            
-            # Evaluate
-            if (epoch + 1) % 5 == 0:
-                print("\nEvaluating model...")
-                eval_metrics = self.evaluate(num_games=10)
-                
-                # Log chess metrics
-                self.metrics_logger.log_chess(epoch, eval_metrics)
-                
-                print(f"Win Rate: {eval_metrics['win_rate']:.2%}")
-                print(f"Elo Estimate: {eval_metrics['elo_estimate']:.0f}")
-            
-            # Save checkpoint
-            is_best = train_metrics['loss'] < self.best_loss
-            if is_best:
-                self.best_loss = train_metrics['loss']
-            
-            self.save_checkpoint(is_best=is_best)
-            
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"  Loss: {train_metrics['loss']:.4f}")
-            print(f"  Policy Loss: {train_metrics['policy_loss']:.4f}")
-            print(f"  Value Loss: {train_metrics['value_loss']:.4f}")
-            print(f"  Top-1 Accuracy: {train_metrics['acc_top1']:.2%}")
-            print(f"  Top-5 Accuracy: {train_metrics['acc_top5']:.2%}")
-        
-        print(f"\n{'='*60}")
-        print(f"  TRAINING COMPLETED")
-        print(f"{'='*60}\n")
-        
-        self.metrics_logger.close()
+            print(f"Epoch {epoch} - Loss: {loss:.4f}, Acc: {acc:.2%}, Buffer: {len(replay_buffer)}")
+            self.save_checkpoint(f"checkpoint_rl_{epoch}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Archimedes Chess AI Training")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--games-per-epoch", type=int, default=50, help="Self-play games per epoch")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--device", type=str, default="auto", help="Device (cuda/cpu/auto)")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--h5", type=str, default="distillzero_dataset.h5")
+    parser.add_argument("--sf", type=str, default="assets/stockfish")
+    parser.add_argument("--epochs", type=int, default=100)
     args = parser.parse_args()
     
-    # Determine device
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            print(f"[Device] Using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            device = torch.device("cpu")
-            print("[Device] GPU not available, using CPU (training will be slower)")
-    else:
-        device = torch.device(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ChessResNet()
+    trainer = Trainer(model, device)
     
-    # Create model
-    print("[Model] Initializing Archimedes GNN...")
-    model = ArchimedesGNN(
-        hidden_dim=256,
-        num_layers=4,
-        num_heads=8,
-        dropout=0.1
-    )
-    
-    print(f"[Model] Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Create trainer
-    trainer = Trainer(
-        model=model,
-        device=device,
-        learning_rate=args.lr,
-        checkpoint_dir=args.checkpoint_dir
-    )
-    
-    # Train
-    trainer.train(
-        num_epochs=args.epochs,
-        games_per_epoch=args.games_per_epoch,
-        batch_size=args.batch_size
-    )
-
+    trainer.train(args.h5, args.sf, num_epochs=args.epochs)
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
     main()
