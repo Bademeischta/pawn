@@ -4,19 +4,19 @@ MCTS implementation with transposition tables, PUCT algorithm, and comprehensive
 """
 
 import chess
+import chess.polyglot
 import numpy as np
 import math
 import time
-from typing import Dict, List, Tuple, Optional
+import torch
+from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
-from collections import defaultdict
-import hashlib
 
 
 @dataclass
 class MCTSNode:
     """Node in the MCTS tree."""
-    board_hash: str
+    board_hash: Union[str, int]
     parent: Optional['MCTSNode'] = None
     move: Optional[chess.Move] = None
     children: Dict[chess.Move, 'MCTSNode'] = field(default_factory=dict)
@@ -42,6 +42,8 @@ class MCTSNode:
         Upper Confidence Bound for Trees (UCT) with PUCT.
         Balances exploitation (Q) and exploration (U).
         """
+        # Note: This method is now primarily for documentation as the logic
+        # is inlined in MCTS._select_child for performance.
         if self.visit_count == 0:
             u = c_puct * self.prior_prob * math.sqrt(parent_visits)
             return u
@@ -58,19 +60,17 @@ class TranspositionTable:
     """
     
     def __init__(self, max_size: int = 1000000):
-        self.table: Dict[str, MCTSNode] = {}
+        self.table: Dict[Union[str, int], MCTSNode] = {}
         self.max_size = max_size
         self.hits = 0
         self.misses = 0
     
-    def get_hash(self, board: chess.Board) -> str:
+    def get_hash(self, board: chess.Board) -> int:
         """Generate hash for board position."""
-        # Use FEN without move counters for transposition
-        fen_parts = board.fen().split()
-        key_fen = ' '.join(fen_parts[:4])  # Position, turn, castling, en passant
-        return hashlib.md5(key_fen.encode()).hexdigest()
+        # Optimization: Use Zobrist hashing which is much faster than FEN+MD5
+        return chess.polyglot.zobrist_hash(board)
     
-    def get(self, board_hash: str) -> Optional[MCTSNode]:
+    def get(self, board_hash: Union[str, int]) -> Optional[MCTSNode]:
         """Retrieve node from table."""
         node = self.table.get(board_hash)
         if node:
@@ -79,7 +79,7 @@ class TranspositionTable:
             self.misses += 1
         return node
     
-    def put(self, board_hash: str, node: MCTSNode):
+    def put(self, board_hash: Union[str, int], node: MCTSNode):
         """Store node in table."""
         if len(self.table) >= self.max_size:
             # Simple eviction: remove random entry
@@ -109,9 +109,13 @@ class MCTSMetrics:
         self.max_depth = 0
         self.depth_sum = 0
         self.depth_count = 0
-        self.q_values = []
-        self.visit_counts = []
-        self.branching_factors = []
+        # Optimization: Use running sums for mean and std to avoid large list allocations
+        self.q_sum = 0.0
+        self.q_sq_sum = 0.0
+        self.visit_sum = 0
+        self.visit_sq_sum = 0
+        self.branch_sum = 0
+        self.branch_count = 0
         self.cutoffs = 0
         self.total_branches = 0
         self.search_time = 0.0
@@ -123,10 +127,16 @@ class MCTSMetrics:
         self.max_depth = max(self.max_depth, depth)
         self.depth_sum += depth
         self.depth_count += 1
-        self.q_values.append(q_value)
-        self.visit_counts.append(visit_count)
+
+        # Accumulate sums for mean and variance
+        self.q_sum += q_value
+        self.q_sq_sum += q_value * q_value
+        self.visit_sum += visit_count
+        self.visit_sq_sum += visit_count * visit_count
+
         if num_children > 0:
-            self.branching_factors.append(num_children)
+            self.branch_sum += num_children
+            self.branch_count += 1
     
     def record_cutoff(self):
         """Record a branch cutoff."""
@@ -134,17 +144,27 @@ class MCTSMetrics:
     
     def get_summary(self) -> Dict[str, float]:
         """Get summary statistics."""
+        def calc_stats(count, total_sum, sq_sum):
+            if count == 0:
+                return 0.0, 0.0
+            mean = total_sum / count
+            variance = max(0, (sq_sum / count) - (mean * mean))
+            return mean, math.sqrt(variance)
+
+        q_mean, q_std = calc_stats(self.depth_count, self.q_sum, self.q_sq_sum)
+        visit_mean, visit_std = calc_stats(self.depth_count, self.visit_sum, self.visit_sq_sum)
+
         return {
             'total_nodes': self.total_nodes,
             'max_search_depth': self.max_depth,
             'avg_search_depth': self.depth_sum / max(self.depth_count, 1),
             'nodes_per_second': self.total_nodes / max(self.search_time, 0.001),
-            'avg_branching_factor': np.mean(self.branching_factors) if self.branching_factors else 0.0,
+            'avg_branching_factor': self.branch_sum / max(self.branch_count, 1),
             'cutoff_rate': self.cutoffs / max(self.total_nodes, 1),
-            'q_value_mean': np.mean(self.q_values) if self.q_values else 0.0,
-            'q_value_std': np.std(self.q_values) if self.q_values else 0.0,
-            'visit_count_mean': np.mean(self.visit_counts) if self.visit_counts else 0.0,
-            'visit_count_std': np.std(self.visit_counts) if self.visit_counts else 0.0,
+            'q_value_mean': q_mean,
+            'q_value_std': q_std,
+            'visit_count_mean': visit_mean,
+            'visit_count_std': visit_std,
         }
 
 
@@ -184,6 +204,9 @@ class MCTS:
         
         self.transposition_table = TranspositionTable() if use_transposition_table else None
         self.metrics = MCTSMetrics()
+
+        # Optimization: Cache model device to avoid repeated discovery
+        self.device = next(model.parameters()).device
     
     def search(self, board: chess.Board, add_noise: bool = True) -> Tuple[chess.Move, Dict]:
         """
@@ -290,12 +313,10 @@ class MCTS:
             return 0.0
         
         # Evaluate with neural network
-        import torch
         self.model.eval()
         with torch.no_grad():
             data = self.encoder.board_to_graph(board)
-            device = next(self.model.parameters()).device
-            data = data.to(device)
+            data = data.to(self.device)
             
             policy_logits, value, _ = self.model(data)
             value = value.item()
@@ -335,8 +356,18 @@ class MCTS:
         best_child = None
         best_value = -float('inf')
         
+        # Optimization: Pre-calculate constants for UCT to avoid repeated math/method calls
+        sqrt_parent_visits = math.sqrt(node.visit_count)
+        c_puct_sqrt = self.c_puct * sqrt_parent_visits
+
         for move, child in node.children.items():
-            uct = child.uct_value(node.visit_count, self.c_puct)
+            # Inlined and optimized UCT calculation
+            if child.visit_count == 0:
+                uct = c_puct_sqrt * child.prior_prob
+            else:
+                q = child.total_value / child.visit_count
+                u = c_puct_sqrt * child.prior_prob / (1 + child.visit_count)
+                uct = q + u
             
             if uct > best_value:
                 best_value = uct
@@ -428,7 +459,6 @@ if __name__ == "__main__":
     # Test MCTS
     print("Testing MCTS implementation...")
     
-    import torch
     from model import ArchimedesGNN, ChessBoardEncoder
     
     # Create model and encoder
