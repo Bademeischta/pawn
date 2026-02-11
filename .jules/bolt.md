@@ -1,0 +1,3 @@
+## 2025-05-15 - [MCTS Hashing Optimization]
+**Learning:** In Python-based chess engines, using `board.fen()` and `hashlib.md5()` for transposition table hashing is a significant bottleneck. `python-chess` provides `chess.polyglot.zobrist_hash(board)` which is calculated incrementally and is much faster. Also, inlining tight loops like UCT selection and using running sums for metrics avoids the overhead of method calls and large list allocations.
+**Action:** Always prefer `zobrist_hash` for chess board state representation in performance-critical paths. Inline simple calculations in hot loops to minimize Python's function call overhead.
