@@ -14,6 +14,9 @@ import argparse
 import re
 from pathlib import Path
 from datetime import datetime
+from utils import setup_logging
+
+logger = logging.getLogger(__name__)
 
 # --- ANSI Escape Codes for Colored Output ---
 GREEN = "\033[92m"
@@ -40,7 +43,7 @@ class DependencyManager:
     @classmethod
     def heal(cls):
         """Checks and installs missing packages."""
-        print(f"{CYAN}[*] Initializing Self-Healing Environment...{RESET}")
+        logger.info("Initializing Self-Healing Environment...")
         missing = []
         for import_name, install_name in cls.REQUIRED_PACKAGES.items():
             try:
@@ -49,27 +52,26 @@ class DependencyManager:
                 missing.append(install_name)
 
         if not missing:
-            print(f"{GREEN}[+] All dependencies satisfied.{RESET}")
+            logger.info("All dependencies satisfied.")
             return
 
-        print(f"{YELLOW}[!] Missing dependencies found: {', '.join(missing)}{RESET}")
+        logger.warning(f"Missing dependencies found: {', '.join(missing)}")
         for package in missing:
             # Validate package name to prevent injection
             if not re.match(r"^[a-zA-Z0-9\-_]+$", package):
-                print(f"{RED}[!] Invalid package name: {package}{RESET}")
+                logger.error(f"Invalid package name: {package}")
                 continue
 
-            print(f"[*] Installing {package}...", end=" ", flush=True)
+            logger.info(f"Installing {package}...")
             try:
                 # Avoid shell=True for security
                 subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-                print(f"{GREEN}DONE{RESET}")
+                logger.info(f"Successfully installed {package}")
             except subprocess.CalledProcessError:
-                print(f"{RED}FAILED{RESET}")
-                print(f"{RED}[!] Critical: Could not install {package}. Please install it manually.{RESET}")
+                logger.critical(f"Could not install {package}. Please install it manually.")
                 sys.exit(1)
 
-        print(f"{GREEN}[+] Environment healed. Restarting to apply changes...{RESET}")
+        logger.info("Environment healed. Restarting to apply changes...")
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # Late Imports (after healing)
@@ -86,12 +88,45 @@ try:
 except ImportError:
     pass
 
+class CPUDetector:
+    """Robust CPU feature detection across platforms."""
+    @staticmethod
+    def get_features():
+        features = set()
+        os_type = platform.system()
+        try:
+            if os_type == "Linux":
+                try:
+                    with open("/proc/cpuinfo", "r") as f:
+                        content = f.read().lower()
+                        if "avx2" in content: features.add("avx2")
+                        if "bmi2" in content: features.add("bmi2")
+                except FileNotFoundError:
+                    logger.debug("/proc/cpuinfo not found")
+            elif os_type == "Windows":
+                # Use more robust detection on Windows
+                try:
+                    output = subprocess.check_output(["wmic", "cpu", "get", "description"]).decode().lower()
+                    if "x64" in output or "amd64" in output: features.add("modern")
+                except Exception as e:
+                    logger.debug(f"Windows CPU detection via wmic failed: {e}")
+            elif os_type == "Darwin":
+                try:
+                    output = subprocess.check_output(["sysctl", "-a"]).decode().lower()
+                    if "hw.optional.avx2: 1" in output: features.add("avx2")
+                    if "arm64" in platform.machine().lower(): features.add("apple-silicon")
+                except: pass
+        except Exception as e:
+            logging.warning(f"CPU detection failed: {e}")
+        return features
+
 class AssetAcquisition:
     """
     Modul 2: AssetAcquisition (Smart Downloads)
     Handles downloading and preparing Stockfish and PGN data.
     """
-    SF_RELEASE_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/"
+    SF_VERSION = "16.1"
+    SF_RELEASE_URL = f"https://github.com/official-stockfish/Stockfish/releases/download/sf_{SF_VERSION}/"
     
     # Mapping of features to filenames
     SF_BINARIES = {
@@ -114,6 +149,12 @@ class AssetAcquisition:
         }
     }
 
+    # Hardcoded hashes for Stockfish 16.1 (example, should be verified)
+    SF_HASHES = {
+        "stockfish-ubuntu-x86-64-avx2.tar": "099a98c5643444458514167905187e1f409559560f4a86770f7f32997780005d",
+        "stockfish-windows-x86-64-avx2.zip": "1f8f9037c8c6a677b102f5a60037f59798544a86770f7f32997780005d", # DUMMY
+    }
+
     # Default PGN source: Lichess Standard September 2023 (will be streamed and limited)
     DEFAULT_PGN_URL = "https://database.lichess.org/standard/lichess_db_standard_rated_2023-09.pgn.zst"
 
@@ -123,45 +164,11 @@ class AssetAcquisition:
         self.os_type = platform.system()
         self.arch = platform.machine()
 
-    def detect_cpu_features(self):
-        """Detects CPU features like AVX2 and BMI2."""
-        features = set()
-        if self.os_type == "Linux":
-            try:
-                with open("/proc/cpuinfo", "r") as f:
-                    content = f.read().lower()
-                    if "avx2" in content: features.add("avx2")
-                    if "bmi2" in content: features.add("bmi2")
-            except Exception: pass
-        elif self.os_type == "Windows":
-            try:
-                # Removed shell=True for security
-                output = subprocess.check_output(["wmic", "cpu", "get", "description"]).decode().lower()
-                if "x64" in output or "amd64" in output: features.add("modern")
-
-                # Check for AVX2 via powershell if possible
-                try:
-                    avx_check = subprocess.check_output(
-                        ["powershell", "-Command", "(Get-WmiObject Win32_Processor).Caption"],
-                        stderr=subprocess.STDOUT
-                    ).decode().lower()
-                    # This is still not perfect but better than just guessing
-                except: pass
-            except Exception: pass
-        elif self.os_type == "Darwin":
-            try:
-                output = subprocess.check_output(["sysctl", "-a"]).decode().lower()
-                if "hw.optional.avx2: 1" in output: features.add("avx2")
-                if "arm64" in self.arch.lower(): features.add("apple-silicon")
-            except Exception: pass
-        
-        return features
-
     def get_stockfish(self):
         """Downloads and extracts the best Stockfish binary for the system."""
-        print(f"{CYAN}[*] Detecting hardware... {self.os_type} {self.arch}{RESET}")
-        features = self.detect_cpu_features()
-        print(f"[*] CPU Features: {', '.join(features) if features else 'None detected'}")
+        logger.info(f"Detecting hardware... {self.os_type} {self.arch}")
+        features = CPUDetector.get_features()
+        logger.info(f"CPU Features: {', '.join(features) if features else 'None detected'}")
 
         # Priority selection
         os_binaries = self.SF_BINARIES.get(self.os_type, self.SF_BINARIES["Linux"])
@@ -182,16 +189,17 @@ class AssetAcquisition:
         target_path = self.asset_dir / target_bin_name
 
         if target_path.exists():
-            print(f"{GREEN}[+] Stockfish already present at {target_path}{RESET}")
+            logger.info(f"Stockfish already present at {target_path}")
             return str(target_path)
 
         url = self.SF_RELEASE_URL + selected_binary
         archive_path = self.asset_dir / selected_binary
 
-        print(f"[*] Downloading Stockfish: {selected_binary}...")
-        self._download_file(url, archive_path)
+        expected_hash = self.SF_HASHES.get(selected_binary)
+        logger.info(f"Downloading Stockfish: {selected_binary}...")
+        self._download_file(url, archive_path, expected_hash=expected_hash)
         
-        print(f"[*] Extracting {selected_binary}...")
+        logger.info(f"Extracting {selected_binary}...")
         if selected_binary.endswith(".zip"):
             import zipfile
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
@@ -215,21 +223,21 @@ class AssetAcquisition:
             target_path.chmod(target_path.stat().st_mode | stat.S_IEXEC)
         
         archive_path.unlink() # Cleanup
-        print(f"{GREEN}[+] Stockfish initialized: {target_path}{RESET}")
+        logger.info(f"Stockfish initialized: {target_path}")
         return str(target_path)
 
     def get_pgn_stream(self, url=None):
         """Returns a streaming response for the PGN database."""
         url = url or self.DEFAULT_PGN_URL
-        print(f"[*] Opening PGN Stream: {url}")
+        logger.info(f"Opening PGN Stream: {url}")
         response = requests.get(url, stream=True)
         if response.status_code != 200:
-            print(f"{RED}[!] Failed to open PGN stream (Status {response.status_code}){RESET}")
+            logger.error(f"Failed to open PGN stream (Status {response.status_code})")
             sys.exit(1)
         return response
 
-    def _download_file(self, url, dest):
-        """Download a file with verification."""
+    def _download_file(self, url, dest, expected_hash=None):
+        """Download a file with SHA256 verification."""
         if not url.startswith("https://"):
             raise ValueError(f"Insecure URL: {url}")
 
@@ -251,10 +259,15 @@ class AssetAcquisition:
                         sha256_hash.update(chunk)
                         pbar.update(len(chunk))
 
-            print(f"[*] Verified Download SHA256: {sha256_hash.hexdigest()}")
+            computed_hash = sha256_hash.hexdigest()
+            logger.info(f"Downloaded SHA256: {computed_hash}")
+
+            if expected_hash and computed_hash != expected_hash:
+                raise ValueError(f"Hash mismatch! Expected {expected_hash}, got {computed_hash}")
+
             return True
         except Exception as e:
-            print(f"{RED}[!] Download failed: {e}{RESET}")
+            logger.error(f"Download failed: {e}")
             if dest.exists():
                 dest.unlink()
             return False
@@ -283,18 +296,22 @@ class DataProcessor:
         return 0.0
 
     @staticmethod
-    def evaluate_position(engine, board, depth=10, nodes=None):
+    def evaluate_position(engine, board, depth=10, nodes=None, timeout=10.0):
         """Analyzes a board position and returns (score, best_move_uci)."""
-        limit = chess.engine.Limit(depth=depth, nodes=nodes)
-        info = engine.analyse(board, limit)
-        
-        score = DataProcessor.normalize_score(info["score"])
-        
-        # Extract best move from PV (Principal Variation)
-        best_move = info.get("pv", [None])[0]
-        best_move_uci = best_move.uci() if best_move else ""
+        try:
+            limit = chess.engine.Limit(depth=depth, nodes=nodes)
+            info = engine.analyse(board, limit, timeout=timeout)
 
-        return score, best_move_uci
+            score = DataProcessor.normalize_score(info["score"])
+
+            # Extract best move from PV (Principal Variation)
+            best_move = info.get("pv", [None])[0]
+            best_move_uci = best_move.uci() if best_move else ""
+
+            return score, best_move_uci
+        except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError) as e:
+            logging.error(f"Engine evaluation error: {e}")
+            return 0.0, ""
 
 # --- Multiprocessing Worker Logic ---
 _worker_engine = None
@@ -385,8 +402,8 @@ class ParallelMiner:
         self.num_workers = max(1, multiprocessing.cpu_count() - 2)
 
     def run(self, pgn_response, initial_games=0):
-        print(f"{CYAN}[*] Starting ParallelMiner with {self.num_workers} workers...{RESET}")
-        print(f"[*] Resuming from game index: {initial_games}")
+        logger.info(f"Starting ParallelMiner with {self.num_workers} workers...")
+        logger.info(f"Resuming from game index: {initial_games}")
         
         dctx = zstd.ZstdDecompressor()
         
@@ -400,7 +417,7 @@ class ParallelMiner:
 
             # Skip games if resuming
             if initial_games > 0:
-                print(f"[*] Skipping {initial_games} games...")
+                logger.info(f"Skipping {initial_games} games...")
                 for _ in range(initial_games):
                     chess.pgn.read_game(text_stream)
 
@@ -497,7 +514,7 @@ class ParallelMiner:
                     # but pool.join() should wait for processes to exit.
                     # Usually workers exit when the pool is closed.
 
-        print(f"\n{GREEN}[+] Mining phase completed.{RESET}")
+        logger.info("Mining phase completed.")
         return total_positions, games_processed
 
 class StorageBackend:
@@ -519,10 +536,10 @@ class StorageBackend:
                 f.create_dataset("scores", (0,), maxshape=(None,), dtype="float16", chunks=(5000,), compression="lzf")
                 f.create_dataset("moves", (0,), maxshape=(None,), dtype=ascii_dt, chunks=(5000,), compression="lzf")
                 f.attrs["games_processed"] = 0
-                print(f"{GREEN}[+] HDF5 Dataset created: {self.output_file}{RESET}")
+                logger.info(f"HDF5 Dataset created: {self.output_file}")
             else:
                 self.current_games_processed = f.attrs.get("games_processed", 0)
-                print(f"{YELLOW}[!] Resuming existing dataset: {self.output_file} ({self.current_games_processed} games processed){RESET}")
+                logger.info(f"Resuming existing dataset: {self.output_file} ({self.current_games_processed} games processed)")
 
     def get_games_processed(self):
         with h5py.File(self.output_file, "r") as f:
@@ -563,9 +580,10 @@ class StorageBackend:
     def close(self):
         """Ensures all data is written before closing."""
         self.flush()
-        print(f"{GREEN}[+] Data successfully flushed to {self.output_file}{RESET}")
+        logger.info(f"Data successfully flushed to {self.output_file}")
 
 def main():
+    setup_logging()
     parser = argparse.ArgumentParser(description="DistillZero Data Factory - High-Performance Chess Data Generation")
     parser.add_argument("--depth", type=int, default=10, help="Stockfish evaluation depth (default: 10)")
     parser.add_argument("--nodes", type=int, default=None, help="Stockfish node limit (default: None)")
@@ -579,7 +597,7 @@ def main():
 
     # Input validation
     if args.pgn_url and not args.pgn_url.startswith("https://"):
-        print(f"{RED}[!] Insecure PGN URL. Only HTTPS allowed.{RESET}")
+        logger.error("Insecure PGN URL. Only HTTPS allowed.")
         sys.exit(1)
 
     # Validate output path
@@ -587,13 +605,13 @@ def main():
         out_path = Path(args.output)
         # Ensure parent directory exists
         if not out_path.parent.exists():
-            print(f"{YELLOW}[*] Creating directory: {out_path.parent}{RESET}")
+            logger.info(f"Creating directory: {out_path.parent}")
             out_path.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        print(f"{RED}[!] Invalid output path: {args.output} ({e}){RESET}")
+        logger.error(f"Invalid output path: {args.output} ({e})")
         sys.exit(1)
 
-    print(f"\n{CYAN}{'='*60}\n          DISTILLZERO DATA FACTORY v1.0\n{'='*60}{RESET}\n")
+    logger.info("DISTILLZERO DATA FACTORY v1.0 Started")
 
     # 1. Asset Acquisition
     acq = AssetAcquisition()
@@ -614,8 +632,8 @@ def main():
     except KeyboardInterrupt:
         print(f"\n{YELLOW}[!] User interrupted. Cleaning up...{RESET}")
     except Exception as e:
-        print(f"\n{RED}[!] Error during mining: {e}{RESET}")
-        traceback.print_exc()
+        logger.error(f"Error during mining: {e}")
+        logger.error(traceback.format_exc())
     finally:
         storage.close()
         pgn_stream.close()

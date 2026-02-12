@@ -1,4 +1,44 @@
 import torch
+import logging
+import logging.config
+
+def setup_logging(level=logging.INFO):
+    """Set up centralized logging configuration."""
+    LOG_CONFIG = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'formatters': {
+            'standard': {
+                'format': '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+            },
+            'detailed': {
+                'format': '%(asctime)s [%(levelname)s] %(name)s.%(funcName)s:%(lineno)d: %(message)s'
+            },
+        },
+        'handlers': {
+            'default': {
+                'level': level,
+                'class': 'logging.StreamHandler',
+                'formatter': 'standard',
+            },
+            'file': {
+                'level': 'DEBUG',
+                'class': 'logging.handlers.RotatingFileHandler',
+                'filename': 'distillzero.log',
+                'maxBytes': 10485760,  # 10MB
+                'backupCount': 5,
+                'formatter': 'detailed',
+            },
+        },
+        'loggers': {
+            '': {  # root logger
+                'handlers': ['default', 'file'],
+                'level': 'DEBUG',
+            },
+        }
+    }
+    logging.config.dictConfig(LOG_CONFIG)
+
 
 def safe_load_checkpoint(path, device):
     """Load checkpoint with security and backwards compatibility."""
