@@ -231,13 +231,14 @@ class Trainer:
     def __init__(self, 
                  model: nn.Module,
                  device: torch.device,
-                 checkpoint_dir: str = "checkpoints"):
+                 checkpoint_dir: str = "checkpoints",
+                 db_path: str = "training_logs.db"):
         self.model = model.to(device)
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.scaler = torch.cuda.amp.GradScaler()
-        self.metrics_logger = MetricsLogger()
+        self.metrics_logger = MetricsLogger(db_path=db_path)
         
         self.optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
@@ -294,11 +295,31 @@ class Trainer:
         return total_loss / len(dataloader), total_acc / len(dataloader)
 
     def save_checkpoint(self, name):
+        checkpoint_path = self.checkpoint_dir / f"{name}.pt"
         torch.save({
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-        }, self.checkpoint_dir / f"{name}.pt")
+        }, checkpoint_path)
+        # Also keep a 'latest.pt' for easy resume
+        if name != "latest":
+            latest_path = self.checkpoint_dir / "latest.pt"
+            torch.save({
+                'epoch': self.current_epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+            }, latest_path)
+
+    def load_latest_checkpoint(self):
+        latest_path = self.checkpoint_dir / "latest.pt"
+        if latest_path.exists():
+            print(f"[*] Resuming from latest checkpoint: {latest_path}")
+            checkpoint = safe_load_checkpoint(latest_path, self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.current_epoch = checkpoint['epoch'] + 1
+            return True
+        return False
 
     def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10):
         # Phase 1: Supervised Distillation
@@ -374,15 +395,19 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--db-path", type=str, default="training_logs.db", help="Path to SQLite metrics database")
     parser.add_argument("--games-per-epoch", type=int, default=10, help="Self-play games per epoch in Phase 2")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ChessResNet()
     
-    # Update Trainer if needed to handle these new args
-    trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir)
+    trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir, db_path=args.db_path)
     trainer.optimizer.param_groups[0]['lr'] = args.lr
+
+    if args.resume:
+        trainer.load_latest_checkpoint()
 
     trainer.train(
         args.h5,

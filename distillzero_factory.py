@@ -388,18 +388,25 @@ class ParallelMiner:
         self.args = args
         self.num_workers = max(1, multiprocessing.cpu_count() - 2)
 
-    def run(self, pgn_response):
+    def run(self, pgn_response, initial_games=0):
         print(f"{CYAN}[*] Starting ParallelMiner with {self.num_workers} workers...{RESET}")
+        print(f"[*] Resuming from game index: {initial_games}")
         
         dctx = zstd.ZstdDecompressor()
         
         total_positions = 0
-        games_processed = 0
+        games_processed = initial_games
         start_time = time.time()
 
         # Streaming directly from the HTTP response
         with dctx.stream_reader(pgn_response.raw) as reader:
             text_stream = io.TextIOWrapper(reader, encoding='utf-8')
+
+            # Skip games if resuming
+            if initial_games > 0:
+                print(f"[*] Skipping {initial_games} games...")
+                for _ in range(initial_games):
+                    chess.pgn.read_game(text_stream)
 
             with multiprocessing.Pool(
                 processes=self.num_workers,
@@ -467,7 +474,7 @@ class ParallelMiner:
                                     # Memory-efficient batched flush to storage
                                     if len(accumulator) >= 1000:
                                         for f, s, m in accumulator:
-                                            self.storage.add(f, s, m)
+                                            self.storage.add(f, s, m, games_processed=games_processed)
                                         accumulator = []
                                 else:
                                     duplicates_removed += 1
@@ -483,7 +490,7 @@ class ParallelMiner:
 
                     # Final flush of deduplicated positions
                     for f, s, m in accumulator:
-                        self.storage.add(f, s, m)
+                        self.storage.add(f, s, m, games_processed=games_processed)
                 finally:
                     # Explicitly close workers
                     pool.close()
@@ -493,7 +500,7 @@ class ParallelMiner:
                     # Usually workers exit when the pool is closed.
 
         print(f"\n{GREEN}[+] Mining phase completed.{RESET}")
-        return total_positions
+        return total_positions, games_processed
 
 class StorageBackend:
     """
@@ -504,6 +511,7 @@ class StorageBackend:
         self.output_file = output_file
         self.buffer_size = buffer_size
         self.buffer = {"fens": [], "scores": [], "moves": []}
+        self.current_games_processed = 0
         
         # Initialize HDF5 File
         with h5py.File(self.output_file, "a") as f:
@@ -512,28 +520,45 @@ class StorageBackend:
                 f.create_dataset("fens", (0,), maxshape=(None,), dtype=ascii_dt, chunks=(5000,), compression="lzf")
                 f.create_dataset("scores", (0,), maxshape=(None,), dtype="float16", chunks=(5000,), compression="lzf")
                 f.create_dataset("moves", (0,), maxshape=(None,), dtype=ascii_dt, chunks=(5000,), compression="lzf")
+                f.attrs["games_processed"] = 0
                 print(f"{GREEN}[+] HDF5 Dataset created: {self.output_file}{RESET}")
+            else:
+                self.current_games_processed = f.attrs.get("games_processed", 0)
+                print(f"{YELLOW}[!] Resuming existing dataset: {self.output_file} ({self.current_games_processed} games processed){RESET}")
 
-    def add(self, fen, score, move):
+    def get_games_processed(self):
+        with h5py.File(self.output_file, "r") as f:
+            return f.attrs.get("games_processed", 0)
+
+    def set_games_processed(self, count):
+        with h5py.File(self.output_file, "a") as f:
+            f.attrs["games_processed"] = count
+
+    def add(self, fen, score, move, games_processed=None):
         """Adds a single record to the buffer."""
         self.buffer["fens"].append(fen)
         self.buffer["scores"].append(score)
         self.buffer["moves"].append(move)
+        if games_processed is not None:
+            self.current_games_processed = games_processed
         
         if len(self.buffer["fens"]) >= self.buffer_size:
             self.flush()
 
     def flush(self):
         """Flushes the buffer to disk."""
-        if not self.buffer["fens"]:
+        if not self.buffer["fens"] and self.current_games_processed == self.get_games_processed():
             return
 
         count = len(self.buffer["fens"])
         with h5py.File(self.output_file, "a") as f:
-            for key in ["fens", "scores", "moves"]:
-                dset = f[key]
-                dset.resize(dset.shape[0] + count, axis=0)
-                dset[-count:] = self.buffer[key]
+            if count > 0:
+                for key in ["fens", "scores", "moves"]:
+                    dset = f[key]
+                    dset.resize(dset.shape[0] + count, axis=0)
+                    dset[-count:] = self.buffer[key]
+
+            f.attrs["games_processed"] = self.current_games_processed
 
         self.buffer = {k: [] for k in self.buffer}
 
@@ -574,13 +599,18 @@ def main():
     storage = StorageBackend(output_file=args.output, buffer_size=args.buffer_size)
 
     # 3. Mining Phase
+    initial_games = storage.get_games_processed()
     miner = ParallelMiner(engine_path=sf_path, storage=storage, args=args)
 
     start_time = time.time()
+    total_pos = 0
     try:
-        total_pos = miner.run(pgn_stream)
+        total_pos, games_processed = miner.run(pgn_stream, initial_games=initial_games)
     except KeyboardInterrupt:
         print(f"\n{YELLOW}[!] User interrupted. Cleaning up...{RESET}")
+    except Exception as e:
+        print(f"\n{RED}[!] Error during mining: {e}{RESET}")
+        traceback.print_exc()
     finally:
         storage.close()
         pgn_stream.close()
