@@ -189,18 +189,43 @@ class AlphaZeroEncoder:
         # include the previous 7 board states via the board.move_stack.
 
 
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block for channel-wise attention.
+    Standard in high-performance engines like Leela Chess Zero.
+    """
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 class ResBlock(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, use_se: bool = True):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
+        self.se = SEBlock(channels, reduction=16) if use_se else None
 
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        if self.se:
+            out = self.se(out)
         out += residual
         return F.relu(out)
 

@@ -428,10 +428,12 @@ class MetricsLogger:
         cursor = conn.cursor()
         
         query = "SELECT pgn FROM games ORDER BY timestamp DESC"
+        params = ()
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT ?"
+            params = (limit,)
         
-        cursor.execute(query)
+        cursor.execute(query, params)
         rows = cursor.fetchall()
         
         with open(output_file, 'w') as f:
