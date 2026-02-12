@@ -191,6 +191,8 @@ class AssetAcquisition:
 
         if target_path.exists():
             logger.info(f"Stockfish already present at {target_path}")
+            if not self.os_type == "Windows":
+                target_path.chmod(target_path.stat().st_mode | stat.S_IEXEC)
             return str(target_path)
 
         url = self.SF_RELEASE_URL + selected_binary
