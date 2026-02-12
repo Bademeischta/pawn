@@ -43,7 +43,7 @@ st.set_page_config(
 class DashboardData:
     """Handles data loading from metrics database."""
     
-    def __init__(self, db_path: str = "training_logs.db"):
+    def __init__(self, db_path: str = "logs/training_logs.db"):
         self.db_path = db_path
 
     def _safe_query(self, query: str, params: tuple = ()) -> pd.DataFrame:
@@ -442,33 +442,29 @@ class SafePathValidator:
 
     ALLOWED_DIRS = {
         "checkpoints": Path("./checkpoints").resolve(),
-        "logs": Path("./").resolve(), # restricted by extension below
+        "logs": Path("./logs").resolve(),
     }
 
     ALLOWED_EXTENSIONS = {".pt", ".pth", ".db", ".sqlite", ".sqlite3"}
 
     @classmethod
-    def validate_and_get_path(cls, requested_path: str, category: str) -> Path:
+    def validate_and_get_path(cls, requested_path: str) -> Path:
         """
-        Validate path and return safe absolute path.
+        Validate path and return safe absolute path if it's within any allowed directory.
         """
-        if category not in cls.ALLOWED_DIRS:
-            raise ValueError(f"Unknown category: {category}")
-
-        base_dir = cls.ALLOWED_DIRS[category]
-
         try:
             requested = Path(requested_path)
+            full_path = requested.resolve()
 
-            # Reject absolute paths if they don't start with base_dir
-            if requested.is_absolute():
-                full_path = requested.resolve()
-            else:
-                full_path = (base_dir / requested).resolve()
+            # Verify it's within at least one allowed directory
+            is_allowed = False
+            for base_dir in cls.ALLOWED_DIRS.values():
+                if str(full_path).startswith(str(base_dir)):
+                    is_allowed = True
+                    break
 
-            # Verify it's within base_dir
-            if not str(full_path).startswith(str(base_dir)):
-                raise ValueError(f"Path traversal detected: {requested_path}")
+            if not is_allowed:
+                raise ValueError(f"Access denied or path traversal detected: {requested_path}")
 
             # Verify extension
             if full_path.suffix not in cls.ALLOWED_EXTENSIONS:
@@ -535,12 +531,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        db_path_raw = st.text_input("Database Path", value="training_logs.db")
+        db_path_raw = st.text_input("Database Path", value="logs/training_logs.db")
         checkpoint_path_raw = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
         
         try:
-            db_path = str(SafePathValidator.validate_and_get_path(db_path_raw, "logs"))
-            checkpoint_path = str(SafePathValidator.validate_and_get_path(checkpoint_path_raw, "checkpoints"))
+            db_path = str(SafePathValidator.validate_and_get_path(db_path_raw))
+            checkpoint_path = str(SafePathValidator.validate_and_get_path(checkpoint_path_raw))
         except ValueError as e:
             st.error(f"Security Error: {e}")
             st.stop()

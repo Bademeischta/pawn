@@ -115,9 +115,10 @@ class CPUDetector:
                     output = subprocess.check_output(["sysctl", "-a"]).decode().lower()
                     if "hw.optional.avx2: 1" in output: features.add("avx2")
                     if "arm64" in platform.machine().lower(): features.add("apple-silicon")
-                except: pass
+                except Exception as e:
+                    logger.debug(f"macOS CPU detection failed: {e}")
         except Exception as e:
-            logging.warning(f"CPU detection failed: {e}")
+            logger.warning(f"CPU detection main loop failed: {e}")
         return features
 
 class AssetAcquisition:
@@ -374,11 +375,13 @@ def _process_batch(batch_data):
                     continue
 
             results.append((fen, score, best_move))
-        except (chess.engine.EngineTerminatedError, Exception):
+        except (chess.engine.EngineTerminatedError, Exception) as e:
+            logger.warning(f"Worker process encountered error: {e}. Attempting engine restart...")
             # Attempt to restart engine once on error
             try:
                 if _worker_engine: _worker_engine.quit()
-            except Exception: pass
+            except Exception as e2:
+                logger.debug(f"Failed to quit worker engine during recovery: {e2}")
             _worker_engine = None
             if not ensure_engine(): break
             

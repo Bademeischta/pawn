@@ -78,6 +78,7 @@ class TranspositionTable:
         self.max_size = max_size
         self.hits = 0
         self.misses = 0
+        self._lock = threading.Lock()
     
     def get_hash(self, board: chess.Board) -> int:
         """Generate hash for board position."""
@@ -86,27 +87,29 @@ class TranspositionTable:
     
     def get(self, board_hash: Union[str, int]) -> Optional[MCTSNode]:
         """Retrieve node from table."""
-        node = self.table.get(board_hash)
-        if node:
-            self.hits += 1
-        else:
-            self.misses += 1
-        return node
+        with self._lock:
+            node = self.table.get(board_hash)
+            if node:
+                self.hits += 1
+            else:
+                self.misses += 1
+            return node
     
     def put(self, board_hash: Union[str, int], node: MCTSNode):
         """Store node in table with LRU eviction."""
-        if board_hash in self.table:
-            # Move to end to mark as recently used
-            del self.table[board_hash]
-        elif len(self.table) >= self.max_size:
-            # Remove oldest entry (first in dict)
-            it = iter(self.table)
-            try:
-                first = next(it)
-                del self.table[first]
-            except StopIteration:
-                pass
-        self.table[board_hash] = node
+        with self._lock:
+            if board_hash in self.table:
+                # Move to end to mark as recently used
+                del self.table[board_hash]
+            elif len(self.table) >= self.max_size:
+                # Remove oldest entry (first in dict)
+                it = iter(self.table)
+                try:
+                    first = next(it)
+                    del self.table[first]
+                except StopIteration:
+                    pass
+            self.table[board_hash] = node
     
     def get_hit_rate(self) -> float:
         """Calculate cache hit rate."""
@@ -124,45 +127,49 @@ class MCTSMetrics:
     """Tracks MCTS performance metrics."""
     
     def __init__(self):
+        self._lock = threading.Lock()
         self.reset()
     
     def reset(self):
-        self.total_nodes = 0
-        self.max_depth = 0
-        self.depth_sum = 0
-        self.depth_count = 0
-        # Optimization: Use running sums for mean and std to avoid large list allocations
-        self.q_sum = 0.0
-        self.q_sq_sum = 0.0
-        self.visit_sum = 0
-        self.visit_sq_sum = 0
-        self.branch_sum = 0
-        self.branch_count = 0
-        self.cutoffs = 0
-        self.total_branches = 0
-        self.search_time = 0.0
-        self.positions_evaluated = 0
+        with self._lock:
+            self.total_nodes = 0
+            self.max_depth = 0
+            self.depth_sum = 0
+            self.depth_count = 0
+            # Optimization: Use running sums for mean and std to avoid large list allocations
+            self.q_sum = 0.0
+            self.q_sq_sum = 0.0
+            self.visit_sum = 0
+            self.visit_sq_sum = 0
+            self.branch_sum = 0
+            self.branch_count = 0
+            self.cutoffs = 0
+            self.total_branches = 0
+            self.search_time = 0.0
+            self.positions_evaluated = 0
     
     def record_node(self, depth: int, q_value: float, visit_count: int, num_children: int):
         """Record metrics for a node."""
-        self.total_nodes += 1
-        self.max_depth = max(self.max_depth, depth)
-        self.depth_sum += depth
-        self.depth_count += 1
+        with self._lock:
+            self.total_nodes += 1
+            self.max_depth = max(self.max_depth, depth)
+            self.depth_sum += depth
+            self.depth_count += 1
 
-        # Accumulate sums for mean and variance
-        self.q_sum += q_value
-        self.q_sq_sum += q_value * q_value
-        self.visit_sum += visit_count
-        self.visit_sq_sum += visit_count * visit_count
+            # Accumulate sums for mean and variance
+            self.q_sum += q_value
+            self.q_sq_sum += q_value * q_value
+            self.visit_sum += visit_count
+            self.visit_sq_sum += visit_count * visit_count
 
-        if num_children > 0:
-            self.branch_sum += num_children
-            self.branch_count += 1
+            if num_children > 0:
+                self.branch_sum += num_children
+                self.branch_count += 1
     
     def record_cutoff(self):
         """Record a branch cutoff."""
-        self.cutoffs += 1
+        with self._lock:
+            self.cutoffs += 1
     
     def get_summary(self) -> Dict[str, float]:
         """Get summary statistics."""
@@ -173,21 +180,22 @@ class MCTSMetrics:
             variance = max(0, (sq_sum / count) - (mean * mean))
             return mean, math.sqrt(variance)
 
-        q_mean, q_std = calc_stats(self.depth_count, self.q_sum, self.q_sq_sum)
-        visit_mean, visit_std = calc_stats(self.depth_count, self.visit_sum, self.visit_sq_sum)
+        with self._lock:
+            q_mean, q_std = calc_stats(self.depth_count, self.q_sum, self.q_sq_sum)
+            visit_mean, visit_std = calc_stats(self.depth_count, self.visit_sum, self.visit_sq_sum)
 
-        return {
-            'total_nodes': self.total_nodes,
-            'max_search_depth': self.max_depth,
-            'avg_search_depth': self.depth_sum / max(self.depth_count, 1),
-            'nodes_per_second': self.total_nodes / max(self.search_time, 0.001),
-            'avg_branching_factor': self.branch_sum / max(self.branch_count, 1),
-            'cutoff_rate': self.cutoffs / max(self.total_nodes, 1),
-            'q_value_mean': q_mean,
-            'q_value_std': q_std,
-            'visit_count_mean': visit_mean,
-            'visit_count_std': visit_std,
-        }
+            return {
+                'total_nodes': self.total_nodes,
+                'max_search_depth': self.max_depth,
+                'avg_search_depth': self.depth_sum / max(self.depth_count, 1),
+                'nodes_per_second': self.total_nodes / max(self.search_time, 0.001),
+                'avg_branching_factor': self.branch_sum / max(self.branch_count, 1),
+                'cutoff_rate': self.cutoffs / max(self.total_nodes, 1),
+                'q_value_mean': q_mean,
+                'q_value_std': q_std,
+                'visit_count_mean': visit_mean,
+                'visit_count_std': visit_std,
+            }
 
 
 class MCTS:
