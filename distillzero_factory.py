@@ -305,8 +305,9 @@ class DataProcessor:
     def evaluate_position(engine, board, depth=10, nodes=None, timeout=10.0):
         """Analyzes a board position and returns (score, best_move_uci)."""
         try:
-            limit = chess.engine.Limit(depth=depth, nodes=nodes)
-            info = engine.analyse(board, limit, timeout=timeout)
+            # Include timeout in the Limit object
+            limit = chess.engine.Limit(time=timeout, depth=depth, nodes=nodes)
+            info = engine.analyse(board, limit)
 
             score = DataProcessor.normalize_score(info["score"])
 
