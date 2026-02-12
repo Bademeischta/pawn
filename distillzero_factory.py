@@ -72,10 +72,6 @@ class DependencyManager:
         print(f"{GREEN}[+] Environment healed. Restarting to apply changes...{RESET}")
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# Initial Healing
-if __name__ == "__main__":
-    DependencyManager.heal()
-
 # Late Imports (after healing)
 try:
     import chess
@@ -331,7 +327,7 @@ def _close_worker():
 def _process_batch(batch_data):
     """Worker task: processes a batch of FENs with robust engine restart."""
     global _worker_engine
-    fens, depth, nodes, engine_path, hash_size, threads = batch_data
+    fens, depth, nodes, engine_path, hash_size, threads, batch_max_game_idx = batch_data
     results = []
     
     def ensure_engine():
@@ -375,7 +371,7 @@ def _process_batch(batch_data):
                 results.append((fen, score, best_move))
             except Exception:
                 continue
-    return results
+    return results, batch_max_game_idx
 
 class ParallelMiner:
     """
@@ -445,21 +441,23 @@ class ParallelMiner:
                                     current_batch.append(board.fen())
                                     if len(current_batch) >= 100:
                                         yield (current_batch, self.args.depth, self.args.nodes,
-                                               self.engine_path, self.args.hash, self.args.threads)
+                                               self.engine_path, self.args.hash, self.args.threads, games_processed)
                                         current_batch = []
 
                             games_processed += 1
 
                         if current_batch:
                             yield (current_batch, self.args.depth, self.args.nodes,
-                                   self.engine_path, self.args.hash, self.args.threads)
+                                   self.engine_path, self.args.hash, self.args.threads, games_processed)
 
                     # Process batches with Zobrist deduplication
                     seen_hashes = set()
                     duplicates_removed = 0
                     accumulator = []
+                    max_finished_game_idx = initial_games
 
-                    for result_batch in pool.imap_unordered(_process_batch, gen_batches()):
+                    for result_batch, batch_game_idx in pool.imap_unordered(_process_batch, gen_batches()):
+                        max_finished_game_idx = max(max_finished_game_idx, batch_game_idx)
                         for fen, score, move in result_batch:
                             try:
                                 # Standard AlphaZero/Stockfish deduplication via Zobrist hashing
@@ -474,7 +472,7 @@ class ParallelMiner:
                                     # Memory-efficient batched flush to storage
                                     if len(accumulator) >= 1000:
                                         for f, s, m in accumulator:
-                                            self.storage.add(f, s, m, games_processed=games_processed)
+                                            self.storage.add(f, s, m, games_processed=max_finished_game_idx)
                                         accumulator = []
                                 else:
                                     duplicates_removed += 1
@@ -490,7 +488,7 @@ class ParallelMiner:
 
                     # Final flush of deduplicated positions
                     for f, s, m in accumulator:
-                        self.storage.add(f, s, m, games_processed=games_processed)
+                        self.storage.add(f, s, m, games_processed=max_finished_game_idx)
                 finally:
                     # Explicitly close workers
                     pool.close()
@@ -584,8 +582,15 @@ def main():
         print(f"{RED}[!] Insecure PGN URL. Only HTTPS allowed.{RESET}")
         sys.exit(1)
 
-    if not re.match(r"^[a-zA-Z0-9_\-\.]+$", args.output):
-        print(f"{RED}[!] Invalid output filename.{RESET}")
+    # Validate output path
+    try:
+        out_path = Path(args.output)
+        # Ensure parent directory exists
+        if not out_path.parent.exists():
+            print(f"{YELLOW}[*] Creating directory: {out_path.parent}{RESET}")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"{RED}[!] Invalid output path: {args.output} ({e}){RESET}")
         sys.exit(1)
 
     print(f"\n{CYAN}{'='*60}\n          DISTILLZERO DATA FACTORY v1.0\n{'='*60}{RESET}\n")

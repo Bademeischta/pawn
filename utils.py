@@ -14,3 +14,25 @@ def safe_load_checkpoint(path, device):
             UserWarning
         )
         return torch.load(path, map_location=device)
+
+
+def safe_save(obj, path):
+    """
+    Save an object to a path safely using a temporary file.
+    Prevents corruption if the process is interrupted during write.
+    """
+    from pathlib import Path
+    import os
+
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    # Ensure directory exists
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save to temporary file
+    import torch
+    torch.save(obj, str(tmp_path))
+
+    # Atomic rename (on POSIX)
+    os.replace(tmp_path, path)

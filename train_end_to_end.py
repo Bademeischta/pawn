@@ -23,7 +23,7 @@ from model import ChessResNet, AlphaZeroEncoder, MoveEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
 from sumtree import SumTree
-from utils import safe_load_checkpoint
+from utils import safe_load_checkpoint, safe_save
 
 
 class PrioritizedSampler(torch.utils.data.Sampler):
@@ -294,21 +294,22 @@ class Trainer:
             
         return total_loss / len(dataloader), total_acc / len(dataloader)
 
-    def save_checkpoint(self, name):
+    def save_checkpoint(self, name, replay_buffer=None):
         checkpoint_path = self.checkpoint_dir / f"{name}.pt"
-        torch.save({
+        data = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-        }, checkpoint_path)
+        }
+        if replay_buffer is not None:
+            data['replay_buffer'] = replay_buffer
+
+        safe_save(data, checkpoint_path)
+
         # Also keep a 'latest.pt' for easy resume
         if name != "latest":
             latest_path = self.checkpoint_dir / "latest.pt"
-            torch.save({
-                'epoch': self.current_epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-            }, latest_path)
+            safe_save(data, latest_path)
 
     def load_latest_checkpoint(self):
         latest_path = self.checkpoint_dir / "latest.pt"
@@ -318,15 +319,16 @@ class Trainer:
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.current_epoch = checkpoint['epoch'] + 1
-            return True
-        return False
+            return checkpoint.get('replay_buffer', [])
+        return []
 
-    def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10):
+    def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10, initial_replay_buffer=None):
         # Phase 1: Supervised Distillation
         print("--- PHASE 1: Supervised Distillation ---")
         supervised_dataset = StockfishDataset(h5_path, min_eval=0.7)
-        if len(supervised_dataset) > 0:
-            for epoch in range(50):
+        if len(supervised_dataset) > 0 and self.current_epoch < 50:
+            start_ep = self.current_epoch
+            for epoch in range(start_ep, 50):
                 self.current_epoch = epoch
                 sampler = supervised_dataset.get_sampler()
                 loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
@@ -348,9 +350,10 @@ class Trainer:
             
         encoder = AlphaZeroEncoder()
         generator = SelfPlayGenerator(self.model, encoder)
-        replay_buffer = []
+        replay_buffer = initial_replay_buffer if initial_replay_buffer is not None else []
         
-        for epoch in range(self.current_epoch + 1, num_epochs):
+        start_ep_rl = max(self.current_epoch + 1, 51)
+        for epoch in range(start_ep_rl, num_epochs):
             self.current_epoch = epoch
             engine = scheduler.get_engine(epoch) if scheduler else None
             
@@ -384,7 +387,7 @@ class Trainer:
             loss, acc = self.train_epoch(loader, None, epoch, temperature=0.5) # Sharpened T in RL
             
             print(f"Epoch {epoch} - Loss: {loss:.4f}, Acc: {acc:.2%}, Buffer: {len(replay_buffer)}")
-            self.save_checkpoint(f"checkpoint_rl_{epoch}")
+            self.save_checkpoint(f"checkpoint_rl_{epoch}", replay_buffer=replay_buffer)
 
 
 def main():
@@ -406,15 +409,17 @@ def main():
     trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir, db_path=args.db_path)
     trainer.optimizer.param_groups[0]['lr'] = args.lr
 
+    replay_buffer = []
     if args.resume:
-        trainer.load_latest_checkpoint()
+        replay_buffer = trainer.load_latest_checkpoint()
 
     trainer.train(
         args.h5,
         args.sf,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
-        games_per_epoch=args.games_per_epoch
+        games_per_epoch=args.games_per_epoch,
+        initial_replay_buffer=replay_buffer
     )
 
 if __name__ == "__main__":
