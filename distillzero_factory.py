@@ -81,6 +81,7 @@ try:
     import chess
     import chess.pgn
     import chess.engine
+    import chess.polyglot
     import h5py
     import numpy as np
     import requests
@@ -446,16 +447,43 @@ class ParallelMiner:
                             yield (current_batch, self.args.depth, self.args.nodes,
                                    self.engine_path, self.args.hash, self.args.threads)
 
-                    # Process batches
+                    # Process batches with Zobrist deduplication
+                    seen_hashes = set()
+                    duplicates_removed = 0
+                    accumulator = []
+
                     for result_batch in pool.imap_unordered(_process_batch, gen_batches()):
                         for fen, score, move in result_batch:
-                            self.storage.add(fen, score, move)
-                            total_positions += 1
+                            try:
+                                # Standard AlphaZero/Stockfish deduplication via Zobrist hashing
+                                board = chess.Board(fen)
+                                zhash = chess.polyglot.zobrist_hash(board)
+
+                                if zhash not in seen_hashes:
+                                    seen_hashes.add(zhash)
+                                    accumulator.append((fen, score, move))
+                                    total_positions += 1
+
+                                    # Memory-efficient batched flush to storage
+                                    if len(accumulator) >= 1000:
+                                        for f, s, m in accumulator:
+                                            self.storage.add(f, s, m)
+                                        accumulator = []
+                                else:
+                                    duplicates_removed += 1
+                            except Exception:
+                                continue
 
                             if total_positions % 500 == 0:
                                 elapsed = time.time() - start_time
                                 pps = total_positions / elapsed
-                                print(f"\r{MAGENTA}[*] Positions: {total_positions} | Games: {games_processed} | Speed: {pps:.1f} pos/s{RESET}", end="", flush=True)
+                                total_processed = total_positions + duplicates_removed
+                                dedup_rate = (duplicates_removed / total_processed * 100) if total_processed > 0 else 0
+                                print(f"\r{MAGENTA}[*] Positions: {total_positions} | Dedup: {dedup_rate:.1f}% | Speed: {pps:.1f} pos/s{RESET}", end="", flush=True)
+
+                    # Final flush of deduplicated positions
+                    for f, s, m in accumulator:
+                        self.storage.add(f, s, m)
                 finally:
                     # Explicitly close workers
                     pool.close()

@@ -22,6 +22,25 @@ from tqdm import tqdm
 from model import ChessResNet, AlphaZeroEncoder, MoveEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
+from sumtree import SumTree
+from utils import safe_load_checkpoint
+
+
+class PrioritizedSampler(torch.utils.data.Sampler):
+    """Sampler that uses a SumTree for O(log n) prioritized sampling."""
+    def __init__(self, sumtree: SumTree, num_samples: int):
+        self.sumtree = sumtree
+        self.num_samples = num_samples
+
+    def __iter__(self):
+        for _ in range(self.num_samples):
+            # Sample from [0, total_priority]
+            v = np.random.uniform(0, self.sumtree.total_priority)
+            _, _, data_idx = self.sumtree.get_leaf(v)
+            yield int(data_idx)
+
+    def __len__(self):
+        return self.num_samples
 
 
 class StockfishDataset(Dataset):
@@ -38,24 +57,32 @@ class StockfishDataset(Dataset):
         if not os.path.exists(h5_path):
             self.indices = []
             self.length = 0
-            self.priorities = np.array([])
+            self.sumtree = None
         else:
             with h5py.File(self.h5_path, 'r') as f:
                 scores = f['scores'][:]
                 self.indices = np.where(np.abs(scores) >= min_eval)[0]
                 self.length = len(self.indices)
-                # Initialize priorities with 1.0 (uniform at start)
-                self.priorities = np.ones(self.length, dtype=np.float32)
+                # Use SumTree for O(log n) sampling
+                self.sumtree = SumTree(self.length)
+                # Initialize with uniform priority 1.0
+                for i in range(self.length):
+                    self.sumtree.update(i, 1.0)
                 print(f"Loaded {self.length} positions from {h5_path} (min_eval={min_eval})")
 
     def update_priorities(self, indices, errors):
         """Update priorities for sampled indices based on TD-Error."""
+        if self.sumtree is None: return
         for idx, error in zip(indices, errors):
-            self.priorities[idx] = (error + 1e-5) ** self.alpha
+            if idx == -1: continue # Skip if not from PER
+            priority = (error + 1e-5) ** self.alpha
+            self.sumtree.update(idx, priority)
 
-    def get_sampling_probabilities(self):
-        """Get probabilities proportional to priorities."""
-        return self.priorities / self.priorities.sum()
+    def get_sampler(self, num_samples: Optional[int] = None):
+        """Returns an O(log n) PrioritizedSampler."""
+        if self.sumtree is None: return None
+        n = num_samples or self.length
+        return PrioritizedSampler(self.sumtree, n)
 
     def __len__(self):
         return self.length
@@ -280,8 +307,7 @@ class Trainer:
         if len(supervised_dataset) > 0:
             for epoch in range(50):
                 self.current_epoch = epoch
-                probs = supervised_dataset.get_sampling_probabilities()
-                sampler = torch.utils.data.WeightedRandomSampler(probs, num_samples=len(supervised_dataset), replacement=True)
+                sampler = supervised_dataset.get_sampler()
                 loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
                 
                 temp = max(0.5, 2.0 - (epoch / 50) * 1.5)

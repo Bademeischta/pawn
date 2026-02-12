@@ -24,6 +24,7 @@ from io import BytesIO
 from model import ChessResNet, AlphaZeroEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
+from utils import safe_load_checkpoint
 
 
 # Page configuration
@@ -91,9 +92,7 @@ def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
         encoder = AlphaZeroEncoder()
 
         if Path(checkpoint_path).exists():
-            # Use weights_only=True for security if using newer torch versions,
-            # but for compatibility we'll stick to basic load with error handling.
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            checkpoint = safe_load_checkpoint(checkpoint_path, device)
             model.load_state_dict(checkpoint['model_state_dict'])
             model.to(device)
             model.eval()
