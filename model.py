@@ -8,7 +8,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import chess
 import numpy as np
+import threading
+import logging
 from typing import Tuple, List, Dict, Optional
+
+
+_move_encoder: Optional['MoveEncoder'] = None
+_encoder_lock = threading.Lock()
+
+def get_move_encoder() -> 'MoveEncoder':
+    """Get or create the global MoveEncoder instance (thread-safe singleton)."""
+    global _move_encoder
+    if _move_encoder is None:
+        with _encoder_lock:
+            if _move_encoder is None:
+                _move_encoder = MoveEncoder()
+    return _move_encoder
 
 
 class MoveEncoder:
@@ -112,6 +127,33 @@ class MoveEncoder:
         if m:
             return chess.Move(m[0], m[1], m[2])
         return None
+
+    def validate_completeness(self, test_positions: int = 500) -> bool:
+        """Validate that all legal moves in random positions are covered by the encoder."""
+        import random
+        board = chess.Board()
+        unmapped = set()
+
+        for _ in range(test_positions):
+            for move in board.legal_moves:
+                idx = self.move_to_index(move)
+                if idx == -1:
+                    unmapped.add(move.uci())
+
+            if board.legal_moves:
+                board.push(random.choice(list(board.legal_moves)))
+            else:
+                board.reset()
+
+            if board.is_game_over():
+                board.reset()
+
+        if unmapped:
+            logging.warning(f"[MoveEncoder] Validation Failed! Unmapped moves: {sorted(list(unmapped))}")
+            return False
+
+        logging.info("[MoveEncoder] Validation Passed: All legal moves in test positions are covered.")
+        return True
 
 
 class AlphaZeroEncoder:
@@ -285,7 +327,7 @@ class ChessResNet(nn.Module):
         dummy_input = torch.randn(1, 119, 8, 8)
         traced = torch.jit.trace(self, dummy_input)
         traced.save(output_path)
-        print(f"Model exported to TorchScript: {output_path}")
+        logging.info(f"Model exported to TorchScript: {output_path}")
 
     def export_onnx(self, output_path: str = "model.onnx"):
         """Export model to ONNX."""
@@ -296,7 +338,7 @@ class ChessResNet(nn.Module):
             input_names=['board'], output_names=['policy', 'value'],
             dynamic_axes={'board': {0: 'batch'}}
         )
-        print(f"Model exported to ONNX: {output_path}")
+        logging.info(f"Model exported to ONNX: {output_path}")
 
 
 if __name__ == "__main__":

@@ -8,10 +8,13 @@ import threading
 import queue
 import time
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import psutil
+
+logger = logging.getLogger(__name__)
 
 try:
     import pynvml
@@ -54,7 +57,7 @@ class MetricsLogger:
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.writer_thread.start()
         
-        print(f"[MetricsLogger] Initialized with database: {self.db_path}")
+        logger.info(f"Initialized with database: {self.db_path}")
     
     def _init_database(self):
         """Initialize all database tables."""
@@ -188,7 +191,7 @@ class MetricsLogger:
         
         conn.commit()
         conn.close()
-        print("[MetricsLogger] Database schema initialized")
+        logger.info("Database schema initialized")
     
     def _writer_loop(self):
         """Background thread that writes metrics to database."""
@@ -222,6 +225,11 @@ class MetricsLogger:
         # Group by table
         tables = {}
         for table_name, data in buffer:
+            # Security check for table name
+            if table_name not in self.__class__.ALLOWED_TABLES:
+                logger.error(f"Unauthorized table access blocked: {table_name}")
+                continue
+
             if table_name not in tables:
                 tables[table_name] = []
             tables[table_name].append(data)
@@ -233,13 +241,19 @@ class MetricsLogger:
             
             # Build INSERT statement
             columns = list(records[0].keys())
+            # Security check for column names (must be alphanumeric)
+            columns = [c for c in columns if c.isidentifier()]
+
             placeholders = ','.join(['?' for _ in columns])
             query = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})"
             
             # Convert records to tuples
             values = [tuple(record[col] for col in columns) for record in records]
             
-            cursor.executemany(query, values)
+            try:
+                cursor.executemany(query, values)
+            except sqlite3.Error as e:
+                logger.error(f"Database insertion error in {table_name}: {e}")
         
         conn.commit()
         conn.close()
@@ -441,17 +455,17 @@ class MetricsLogger:
                 f.write(row[0] + "\n\n")
         
         conn.close()
-        print(f"[MetricsLogger] Exported {len(rows)} games to {output_file}")
+        logger.info(f"Exported {len(rows)} games to {output_file}")
     
     def close(self):
         """Gracefully shutdown the logger."""
-        print("[MetricsLogger] Shutting down...")
+        logger.info("Shutting down...")
         self.running = False
 
         # Wait for queue to be processed, but with a longer timeout if it has many items
         queue_size = self.queue.qsize()
         timeout = max(5.0, queue_size * 0.05)
-        print(f"[MetricsLogger] Waiting up to {timeout:.1f}s for {queue_size} items to be flushed...")
+        logger.info(f"Waiting up to {timeout:.1f}s for {queue_size} items to be flushed...")
 
         self.writer_thread.join(timeout=timeout)
         
@@ -461,16 +475,16 @@ class MetricsLogger:
             except:
                 pass
         
-        print("[MetricsLogger] Closed successfully")
+        logger.info("Closed successfully")
 
 
 if __name__ == "__main__":
     # Test the logger
-    logger = MetricsLogger("test_metrics.db")
+    test_logger = MetricsLogger("test_metrics.db")
     
     # Simulate some metrics
     for epoch in range(3):
-        logger.log_training(epoch, 0, {
+        test_logger.log_training(epoch, 0, {
             'loss_total': 0.5 - epoch * 0.1,
             'loss_policy': 0.3 - epoch * 0.05,
             'loss_value': 0.2 - epoch * 0.05,
@@ -478,20 +492,20 @@ if __name__ == "__main__":
             'accuracy_top1': 0.5 + epoch * 0.1,
         })
         
-        logger.log_mcts(epoch, {
+        test_logger.log_mcts(epoch, {
             'avg_search_depth': 10.0 + epoch,
             'nodes_per_second': 1000.0 + epoch * 100,
             'cache_hit_rate': 0.7 + epoch * 0.05,
         })
         
-        logger.log_chess(epoch, {
+        test_logger.log_chess(epoch, {
             'elo_estimate': 1500.0 + epoch * 50,
             'win_rate': 0.4 + epoch * 0.05,
             'draw_rate': 0.3,
             'loss_rate': 0.3 - epoch * 0.05,
         })
         
-        logger.log_hardware(epoch)
+        test_logger.log_hardware(epoch)
         
         time.sleep(0.5)
     
@@ -499,9 +513,9 @@ if __name__ == "__main__":
     
     # Retrieve and print metrics
     print("\nLatest Training Metrics:")
-    metrics = logger.get_latest_metrics('training_metrics', limit=3)
+    metrics = test_logger.get_latest_metrics('training_metrics', limit=3)
     for m in metrics:
         print(f"  Epoch {m['epoch']}: Loss={m['loss_total']:.3f}, Acc={m['accuracy_top1']:.3f}")
     
-    logger.close()
+    test_logger.close()
     print("\nTest completed successfully!")

@@ -10,6 +10,7 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import sqlite3
+import logging
 import chess
 import chess.svg
 import torch
@@ -18,13 +19,16 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 import base64
+import os
 from io import BytesIO
 
 # Import project modules
 from model import ChessResNet, AlphaZeroEncoder
 from mcts import MCTS
 from metrics import MetricsLogger
-from utils import safe_load_checkpoint
+from utils import safe_load_checkpoint, setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 # Page configuration
@@ -433,13 +437,47 @@ def play_vs_ai_tab(model, encoder, device):
             st.write(" ".join(st.session_state.move_history))
 
 
-def validate_path(path_str: str, allowed_extensions: List[str]) -> bool:
-    """Validate that a path is safe and has an allowed extension."""
-    path = Path(path_str)
-    # Basic path traversal protection
-    if ".." in path_str or path_str.startswith("/"):
-        return False
-    return path.suffix in allowed_extensions
+class SafePathValidator:
+    """Validates file paths against LFI attacks with strict whitelisting."""
+
+    ALLOWED_DIRS = {
+        "checkpoints": Path("./checkpoints").resolve(),
+        "logs": Path("./").resolve(), # restricted by extension below
+    }
+
+    ALLOWED_EXTENSIONS = {".pt", ".pth", ".db", ".sqlite", ".sqlite3"}
+
+    @classmethod
+    def validate_and_get_path(cls, requested_path: str, category: str) -> Path:
+        """
+        Validate path and return safe absolute path.
+        """
+        if category not in cls.ALLOWED_DIRS:
+            raise ValueError(f"Unknown category: {category}")
+
+        base_dir = cls.ALLOWED_DIRS[category]
+
+        try:
+            requested = Path(requested_path)
+
+            # Reject absolute paths if they don't start with base_dir
+            if requested.is_absolute():
+                full_path = requested.resolve()
+            else:
+                full_path = (base_dir / requested).resolve()
+
+            # Verify it's within base_dir
+            if not str(full_path).startswith(str(base_dir)):
+                raise ValueError(f"Path traversal detected: {requested_path}")
+
+            # Verify extension
+            if full_path.suffix not in cls.ALLOWED_EXTENSIONS:
+                raise ValueError(f"File type not allowed: {full_path.suffix}")
+
+            return full_path
+
+        except Exception as e:
+            raise ValueError(f"Invalid path: {e}")
 
 
 def position_analysis_tab(model, encoder, device):
@@ -487,6 +525,7 @@ def position_analysis_tab(model, encoder, device):
 
 def main():
     """Main dashboard application."""
+    setup_logging()
     
     # Title
     st.title("♟️ Archimedes Chess AI Dashboard")
@@ -496,16 +535,14 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        db_path = st.text_input("Database Path", value="training_logs.db")
-        checkpoint_path = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
+        db_path_raw = st.text_input("Database Path", value="training_logs.db")
+        checkpoint_path_raw = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
         
-        # Path validation
-        if not validate_path(db_path, [".db", ".sqlite", ".sqlite3"]):
-            st.error("Invalid database path. Must be a local file with .db, .sqlite or .sqlite3 extension.")
-            st.stop()
-
-        if not validate_path(checkpoint_path, [".pt", ".pth"]):
-            st.error("Invalid checkpoint path. Must be a local file with .pt or .pth extension.")
+        try:
+            db_path = str(SafePathValidator.validate_and_get_path(db_path_raw, "logs"))
+            checkpoint_path = str(SafePathValidator.validate_and_get_path(checkpoint_path_raw, "checkpoints"))
+        except ValueError as e:
+            st.error(f"Security Error: {e}")
             st.stop()
 
         auto_refresh = st.checkbox("Auto Refresh", value=False)
