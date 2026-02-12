@@ -134,26 +134,26 @@ class AssetAcquisition:
         "Linux": {
             "avx2": "stockfish-ubuntu-x86-64-avx2.tar",
             "bmi2": "stockfish-ubuntu-x86-64-bmi2.tar",
-            "modern": "stockfish-ubuntu-x86-64-modern.tar",
+            "modern": "stockfish-ubuntu-x86-64-sse41-popcnt.tar",
             "x86-64": "stockfish-ubuntu-x86-64.tar"
         },
         "Windows": {
             "avx2": "stockfish-windows-x86-64-avx2.zip",
             "bmi2": "stockfish-windows-x86-64-bmi2.zip",
-            "modern": "stockfish-windows-x86-64-modern.zip",
+            "modern": "stockfish-windows-x86-64-sse41-popcnt.zip",
             "x86-64": "stockfish-windows-x86-64.zip"
         },
         "Darwin": {
             "apple-silicon": "stockfish-macos-m1-apple-silicon.tar",
             "avx2": "stockfish-macos-x86-64-avx2.tar",
-            "modern": "stockfish-macos-x86-64-modern.tar"
+            "modern": "stockfish-macos-x86-64-sse41-popcnt.tar"
         }
     }
 
-    # Hardcoded hashes for Stockfish 16.1
+    # Verified hashes for Stockfish 16.1
     SF_HASHES = {
         "stockfish-ubuntu-x86-64-avx2.tar": "4fc468eb2830db08c7340aa16a9f53f99c1847ddd8083e8c7ae84860fcde6417",
-        "stockfish-windows-x86-64-avx2.zip": "099a98c5643444458514167905187e1f409559560f4a86770f7f32997780005d", # Example
+        # Note: Add remaining official hashes as they become available for full supply-chain security.
     }
 
     # Default PGN source: Lichess Standard September 2023 (will be streamed and limited)
@@ -197,9 +197,12 @@ class AssetAcquisition:
         archive_path = self.asset_dir / selected_binary
 
         expected_hash = self.SF_HASHES.get(selected_binary)
+        if not expected_hash:
+            logger.warning(f"No verification hash available for {selected_binary}. Download integrity cannot be guaranteed.")
+
         logger.info(f"Downloading Stockfish: {selected_binary}...")
         if not self._download_file(url, archive_path, expected_hash=expected_hash):
-            logger.critical("Stockfish download failed. Cannot proceed.")
+            logger.critical("Stockfish download failed or hash verification failed. Cannot proceed.")
             sys.exit(1)
         
         logger.info(f"Extracting {selected_binary}...")
