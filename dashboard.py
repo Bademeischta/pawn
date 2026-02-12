@@ -16,6 +16,8 @@ import chess.svg
 import torch
 import time
 import json
+import argparse
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 import base64
@@ -441,9 +443,14 @@ class SafePathValidator:
     """Validates file paths against LFI attacks with strict whitelisting."""
 
     ALLOWED_DIRS = {
+        "project_root": Path("./").resolve(),
         "checkpoints": Path("./checkpoints").resolve(),
         "logs": Path("./logs").resolve(),
     }
+
+    # Add Colab content directory if running in Colab
+    if os.path.exists("/content"):
+        ALLOWED_DIRS["colab_root"] = Path("/content").resolve()
 
     ALLOWED_EXTENSIONS = {".pt", ".pth", ".db", ".sqlite", ".sqlite3"}
 
@@ -522,6 +529,21 @@ def position_analysis_tab(model, encoder, device):
 def main():
     """Main dashboard application."""
     setup_logging()
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db-path", type=str, default="logs/training_logs.db", help="Path to SQLite metrics database")
+    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/latest_checkpoint.pt", help="Path to model checkpoint")
+
+    # Handle streamlit-specific argument passing
+    try:
+        args, unknown = parser.parse_known_args()
+    except Exception:
+        # Fallback if argparse fails within streamlit
+        class Args:
+            db_path = "logs/training_logs.db"
+            checkpoint_path = "checkpoints/latest_checkpoint.pt"
+        args = Args()
     
     # Title
     st.title("♟️ Archimedes Chess AI Dashboard")
@@ -531,12 +553,19 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        db_path_raw = st.text_input("Database Path", value="logs/training_logs.db")
-        checkpoint_path_raw = st.text_input("Checkpoint Path", value="checkpoints/latest_checkpoint.pt")
+        db_path_raw = st.text_input("Database Path", value=args.db_path)
+        checkpoint_path_raw = st.text_input("Checkpoint Path", value=args.checkpoint_path)
         
         try:
             db_path = str(SafePathValidator.validate_and_get_path(db_path_raw))
             checkpoint_path = str(SafePathValidator.validate_and_get_path(checkpoint_path_raw))
+
+            # Show file status
+            if not Path(db_path).exists():
+                st.warning(f"⚠️ Database not found at: {db_path_raw}")
+            if not Path(checkpoint_path).exists():
+                st.warning(f"⚠️ Checkpoint not found at: {checkpoint_path_raw}")
+
         except ValueError as e:
             st.error(f"Security Error: {e}")
             st.stop()
