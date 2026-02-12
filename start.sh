@@ -103,15 +103,16 @@ echo ""
 
 # Start training and dashboard
 echo "=========================================="
-echo "  STARTING ARCHIMEDES"
+echo "  STARTING DISTILLZERO"
 echo "=========================================="
 echo ""
 
 # Parse command line arguments
 EPOCHS=100
-GAMES_PER_EPOCH=50
-BATCH_SIZE=32
+GAMES_PER_EPOCH=10
+BATCH_SIZE=64
 LEARNING_RATE=0.001
+H5_PATH="distillzero_dataset.h5"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -129,6 +130,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lr)
             LEARNING_RATE="$2"
+            shift 2
+            ;;
+        --h5)
+            H5_PATH="$2"
             shift 2
             ;;
         --dashboard-only)
@@ -173,6 +178,7 @@ if [ "$DASHBOARD_ONLY" != true ]; then
         --games-per-epoch $GAMES_PER_EPOCH \
         --batch-size $BATCH_SIZE \
         --lr $LEARNING_RATE \
+        --h5 $H5_PATH \
         > logs/training.log 2>&1 &
     TRAINING_PID=$!
     echo "Training PID: $TRAINING_PID"
@@ -196,7 +202,7 @@ if [ "$TRAINING_ONLY" != true ]; then
     sleep 5
     
     echo "=========================================="
-    echo -e "${GREEN}  ✓ ARCHIMEDES IS RUNNING!${NC}"
+    echo -e "${GREEN}  ✓ DISTILLZERO IS RUNNING!${NC}"
     echo "=========================================="
     echo ""
     echo "📊 Dashboard: http://localhost:8501"

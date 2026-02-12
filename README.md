@@ -65,7 +65,7 @@ python distillzero_factory.py --max-games 10000 --output distillzero_dataset.h5
 
 ### 2. Start Training
 ```bash
-python train_end_to_end.py --h5 distillzero_dataset.h5 --epochs 100
+python train_end_to_end.py --h5 distillzero_dataset.h5 --epochs 100 --batch-size 64
 ```
 
 ### 3. Open Dashboard

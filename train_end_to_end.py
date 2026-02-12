@@ -273,7 +273,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, self.checkpoint_dir / f"{name}.pt")
 
-    def train(self, h5_path, sf_path, num_epochs=100):
+    def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10):
         # Phase 1: Supervised Distillation
         print("--- PHASE 1: Supervised Distillation ---")
         supervised_dataset = StockfishDataset(h5_path, min_eval=0.7)
@@ -282,7 +282,7 @@ class Trainer:
                 self.current_epoch = epoch
                 probs = supervised_dataset.get_sampling_probabilities()
                 sampler = torch.utils.data.WeightedRandomSampler(probs, num_samples=len(supervised_dataset), replacement=True)
-                loader = DataLoader(supervised_dataset, batch_size=64, sampler=sampler, num_workers=4)
+                loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
                 
                 temp = max(0.5, 2.0 - (epoch / 50) * 1.5)
                 loss, acc = self.train_epoch(loader, supervised_dataset, epoch, temperature=temp)
@@ -310,7 +310,7 @@ class Trainer:
             # 1. Data Generation
             print(f"Generating self-play games...")
             new_positions = []
-            for _ in tqdm(range(10), desc="Games"): # 10 games per epoch
+            for _ in tqdm(range(games_per_epoch), desc="Games"):
                 new_positions.extend(generator.generate_game(opponent_engine=engine))
             if engine: engine.quit()
             
@@ -332,7 +332,7 @@ class Trainer:
                         sf_data.append((img, pol, val))
             
             combined_dataset = CombinedDataset(current_self_play_data, sf_data)
-            loader = DataLoader(combined_dataset, batch_size=64, shuffle=True)
+            loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
             
             loss, acc = self.train_epoch(loader, None, epoch, temperature=0.5) # Sharpened T in RL
             
@@ -342,16 +342,29 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--h5", type=str, default="distillzero_dataset.h5")
-    parser.add_argument("--sf", type=str, default="assets/stockfish")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--h5", type=str, default="distillzero_dataset.h5", help="Path to Stockfish HDF5 dataset")
+    parser.add_argument("--sf", type=str, default="assets/stockfish", help="Path to Stockfish binary")
+    parser.add_argument("--epochs", type=int, default=100, help="Total number of epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--games-per-epoch", type=int, default=10, help="Self-play games per epoch in Phase 2")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ChessResNet()
-    trainer = Trainer(model, device)
     
-    trainer.train(args.h5, args.sf, num_epochs=args.epochs)
+    # Update Trainer if needed to handle these new args
+    trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir)
+    trainer.optimizer.param_groups[0]['lr'] = args.lr
+
+    trainer.train(
+        args.h5,
+        args.sf,
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
+        games_per_epoch=args.games_per_epoch
+    )
 
 if __name__ == "__main__":
     main()
