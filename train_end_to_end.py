@@ -204,7 +204,8 @@ class Trainer:
     def __init__(self, 
                  model: nn.Module,
                  device: torch.device,
-                 checkpoint_dir: str = "checkpoints"):
+                 checkpoint_dir: str = "checkpoints",
+                 lr: float = 1e-3):
         self.model = model.to(device)
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -212,7 +213,7 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler()
         self.metrics_logger = MetricsLogger()
         
-        self.optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
 
         self.current_epoch = 0
@@ -355,8 +356,7 @@ def main():
     model = ChessResNet()
     
     # Update Trainer if needed to handle these new args
-    trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir)
-    trainer.optimizer.param_groups[0]['lr'] = args.lr
+    trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir, lr=args.lr)
 
     trainer.train(
         args.h5,
