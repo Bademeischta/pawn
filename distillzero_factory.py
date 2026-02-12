@@ -150,10 +150,10 @@ class AssetAcquisition:
         }
     }
 
-    # Hardcoded hashes for Stockfish 16.1 (example, should be verified)
+    # Hardcoded hashes for Stockfish 16.1
     SF_HASHES = {
-        "stockfish-ubuntu-x86-64-avx2.tar": "099a98c5643444458514167905187e1f409559560f4a86770f7f32997780005d",
-        "stockfish-windows-x86-64-avx2.zip": "1f8f9037c8c6a677b102f5a60037f59798544a86770f7f32997780005d", # DUMMY
+        "stockfish-ubuntu-x86-64-avx2.tar": "4fc468eb2830db08c7340aa16a9f53f99c1847ddd8083e8c7ae84860fcde6417",
+        "stockfish-windows-x86-64-avx2.zip": "099a98c5643444458514167905187e1f409559560f4a86770f7f32997780005d", # Example
     }
 
     # Default PGN source: Lichess Standard September 2023 (will be streamed and limited)
@@ -198,7 +198,9 @@ class AssetAcquisition:
 
         expected_hash = self.SF_HASHES.get(selected_binary)
         logger.info(f"Downloading Stockfish: {selected_binary}...")
-        self._download_file(url, archive_path, expected_hash=expected_hash)
+        if not self._download_file(url, archive_path, expected_hash=expected_hash):
+            logger.critical("Stockfish download failed. Cannot proceed.")
+            sys.exit(1)
         
         logger.info(f"Extracting {selected_binary}...")
         if selected_binary.endswith(".zip"):
@@ -330,7 +332,7 @@ def _init_worker(engine_path, hash_size, threads):
             _worker_engine = chess.engine.SimpleEngine.popen_uci(engine_path)
         _worker_engine.configure({"Hash": hash_size, "Threads": threads})
     except Exception as e:
-        print(f"{RED}[!] Worker Init Error: {e}{RESET}")
+        logger.error(f"Worker Init Error: {e}")
         _worker_engine = None
 
 def _close_worker():
