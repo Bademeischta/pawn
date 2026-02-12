@@ -292,7 +292,7 @@ class Trainer:
                  model: nn.Module,
                  device: torch.device,
                  checkpoint_dir: str = "checkpoints",
-                 db_path: str = "training_logs.db"):
+                 db_path: str = "logs/training_logs.db"):
         self.model = model.to(device)
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -361,7 +361,7 @@ class Trainer:
         valid = True
         for p in self.model.parameters():
             if torch.isnan(p).any() or torch.isinf(p).any():
-                print(f"[!] Warning: NaN/Inf detected in model weights. Checkpoint {name} may be corrupted.")
+                logger.warning(f"NaN/Inf detected in model weights. Checkpoint {name} may be corrupted.")
                 valid = False
                 break
 
@@ -388,7 +388,7 @@ class Trainer:
     def load_latest_checkpoint(self):
         latest_path = self.checkpoint_dir / "latest.pt"
         if latest_path.exists():
-            print(f"[*] Resuming from latest checkpoint: {latest_path}")
+            logger.info(f"Resuming from latest checkpoint: {latest_path}")
             checkpoint = safe_load_checkpoint(latest_path, self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -399,8 +399,15 @@ class Trainer:
         return None
 
     def evaluate_against_stockfish(self, sf_path, num_games=10):
-        """Evaluate current model against Stockfish."""
-        if not os.path.exists(sf_path):
+        """Evaluate current model against Stockfish with path validation."""
+        sf_path_obj = Path(sf_path).resolve()
+        if not sf_path_obj.exists():
+            logger.warning(f"Stockfish not found at {sf_path}")
+            return 0.0
+
+        # Basic security check: ensure it's an executable file
+        if not os.access(sf_path_obj, os.X_OK):
+            logger.error(f"Stockfish path {sf_path} is not executable")
             return 0.0
 
         from mcts import MCTS
@@ -517,7 +524,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--db-path", type=str, default="training_logs.db", help="Path to SQLite metrics database")
+    parser.add_argument("--db-path", type=str, default="logs/training_logs.db", help="Path to SQLite metrics database")
     parser.add_argument("--games-per-epoch", type=int, default=10, help="Self-play games per epoch in Phase 2")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     args = parser.parse_args()

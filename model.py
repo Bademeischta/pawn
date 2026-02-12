@@ -19,10 +19,9 @@ _encoder_lock = threading.Lock()
 def get_move_encoder() -> 'MoveEncoder':
     """Get or create the global MoveEncoder instance (thread-safe singleton)."""
     global _move_encoder
-    if _move_encoder is None:
-        with _encoder_lock:
-            if _move_encoder is None:
-                _move_encoder = MoveEncoder()
+    with _encoder_lock:
+        if _move_encoder is None:
+            _move_encoder = MoveEncoder()
     return _move_encoder
 
 

@@ -34,8 +34,10 @@ class MetricsLogger:
         "hardware_metrics", "games", "position_analysis"
     }
 
-    def __init__(self, db_path: str = "training_logs.db", buffer_size: int = 500):
+    def __init__(self, db_path: str = "logs/training_logs.db", buffer_size: int = 500):
         self.db_path = Path(db_path)
+        # Ensure directory exists
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.buffer_size = buffer_size
         self.queue = queue.Queue()
         self.running = True
