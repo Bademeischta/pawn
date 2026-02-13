@@ -1,7 +1,6 @@
 <#
 .SYNOPSIS
     Pawn Chess AI - Windows Startup Script
-    Robust setup and launch script for the Pawn project.
 #>
 
 param (
@@ -18,12 +17,10 @@ Write-Host ""
 # 1. Python Detection
 Write-Host "ℹ Checking Python installation..." -ForegroundColor Cyan
 try {
-    # Check if python is in PATH using Get-Command to avoid pipeline errors
     if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
         throw "Python executable not found in PATH."
     }
 
-    # Get version string safely
     $pyVersionInfo = python --version 2>&1 | Out-String
     
     if ($pyVersionInfo -match "Python 3") {
@@ -59,10 +56,8 @@ $VenvPython = Join-Path $VenvScripts "python.exe"
 $VenvPip = Join-Path $VenvScripts "pip.exe"
 $VenvStreamlit = Join-Path $VenvScripts "streamlit.exe"
 
-# Verify Venv Python exists
 if (-not (Test-Path $VenvPython)) {
     Write-Host "✖ Venv Python not found at $VenvPython. The venv might be corrupted." -ForegroundColor Red
-    Write-Host "  Try deleting the 'venv' folder and running this script again." -ForegroundColor Red
     exit 1
 }
 
@@ -71,10 +66,8 @@ Write-Host "✔ Using Python at: $VenvPython" -ForegroundColor Green
 # 3. Dependencies
 Write-Host "ℹ Installing/Updating dependencies..." -ForegroundColor Cyan
 try {
-    # Upgrade pip
     & $VenvPython -m pip install --upgrade pip setuptools wheel | Out-Null
     
-    # Install requirements
     if (Test-Path "requirements.txt") {
         & $VenvPip install -r requirements.txt
         if ($LASTEXITCODE -ne 0) { throw "Pip install failed." }
@@ -106,7 +99,6 @@ if (-not (Test-Path $AbsStockfishPath)) {
 
 if (-not (Test-Path $AbsStockfishPath)) {
     Write-Host "⚠ Stockfish executable not found at: $StockfishPath" -ForegroundColor Yellow
-    Write-Host "  The system will attempt to download it automatically via distillzero_factory.py later." -ForegroundColor Yellow
 } else {
     Write-Host "✔ Stockfish found at: $AbsStockfishPath" -ForegroundColor Green
 }
@@ -126,7 +118,6 @@ if (-not (Test-Path "dashboard.py")) {
 }
 
 try {
-    # Start Streamlit in a new window/process
     Start-Process -FilePath $VenvStreamlit -ArgumentList "run dashboard.py" -NoNewWindow
     Write-Host "✔ Dashboard launched." -ForegroundColor Green
 } catch {
