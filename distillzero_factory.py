@@ -208,29 +208,36 @@ class AssetAcquisition:
             sys.exit(1)
         
         logger.info(f"Extracting {selected_binary}...")
-        if selected_binary.endswith(".zip"):
-            import zipfile
-            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                # Find the largest file (likely the binary)
-                members = [m for m in zip_ref.infolist() if not m.is_dir()]
-                best_member = max(members, key=lambda m: m.file_size)
-                data = zip_ref.read(best_member)
-                with open(target_path, "wb") as f:
-                    f.write(data)
-        else:
-            import tarfile
-            with tarfile.open(archive_path, 'r') as tar_ref:
-                # Find the largest file (likely the binary)
-                members = [m for m in tar_ref.getmembers() if m.isfile()]
-                best_member = max(members, key=lambda m: m.size)
-                content = tar_ref.extractfile(best_member)
-                with open(target_path, "wb") as f:
-                    f.write(content.read())
-        
+        try:
+            if selected_binary.endswith(".zip"):
+                import zipfile
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    # Find the largest file (likely the binary)
+                    members = [m for m in zip_ref.infolist() if not m.is_dir()]
+                    best_member = max(members, key=lambda m: m.file_size)
+                    data = zip_ref.read(best_member)
+                    with open(target_path, "wb") as f:
+                        f.write(data)
+            else:
+                import tarfile
+                with tarfile.open(archive_path, 'r') as tar_ref:
+                    # Find the largest file (likely the binary)
+                    members = [m for m in tar_ref.getmembers() if m.isfile()]
+                    best_member = max(members, key=lambda m: m.size)
+                    content = tar_ref.extractfile(best_member)
+                    with open(target_path, "wb") as f:
+                        f.write(content.read())
+        except Exception as e:
+            logger.error(f"Extraction failed: {e}")
+            if target_path.exists(): target_path.unlink()
+            sys.exit(1)
+        finally:
+            if archive_path.exists():
+                archive_path.unlink() # Cleanup
+
         if not self.os_type == "Windows":
             target_path.chmod(target_path.stat().st_mode | stat.S_IEXEC)
         
-        archive_path.unlink() # Cleanup
         logger.info(f"Stockfish initialized: {target_path}")
         return str(target_path)
 
@@ -238,11 +245,15 @@ class AssetAcquisition:
         """Returns a streaming response for the PGN database."""
         url = url or self.DEFAULT_PGN_URL
         logger.info(f"Opening PGN Stream: {url}")
-        response = requests.get(url, stream=True)
-        if response.status_code != 200:
-            logger.error(f"Failed to open PGN stream (Status {response.status_code})")
+        try:
+            response = requests.get(url, stream=True)
+            if response.status_code != 200:
+                logger.error(f"Failed to open PGN stream (Status {response.status_code})")
+                sys.exit(1)
+            return response
+        except Exception as e:
+            logger.error(f"Network error opening PGN stream: {e}")
             sys.exit(1)
-        return response
 
     def _download_file(self, url, dest, expected_hash=None):
         """Download a file with SHA256 verification."""
@@ -319,7 +330,7 @@ class DataProcessor:
 
             return score, best_move_uci
         except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError) as e:
-            logging.error(f"Engine evaluation error: {e}")
+            logger.debug(f"Engine evaluation error: {e}")
             return 0.0, ""
 
 # --- Multiprocessing Worker Logic ---
@@ -360,6 +371,12 @@ def _process_batch(batch_data):
         global _worker_engine
         if _worker_engine is None:
             _init_worker(engine_path, hash_size, threads)
+        if _worker_engine is None:
+            return False
+        # Verify engine is alive
+        if _worker_engine.transport.is_lost():
+             _close_worker()
+             _init_worker(engine_path, hash_size, threads)
         return _worker_engine is not None
 
     if not ensure_engine():
@@ -376,7 +393,7 @@ def _process_batch(batch_data):
 
             score, best_move = DataProcessor.evaluate_position(_worker_engine, board, depth=depth, nodes=nodes)
 
-            # Filter: Skip positions with Stockfish Eval between -0.3 and +0.3 (langweilige Remis)
+            # Filter: Skip positions with Stockfish Eval between -0.3 and +0.3 (boring draws)
             if -0.3 < score < 0.3:
                 # Keep only 10% of "boring" draws
                 if not is_sharp and np.random.random() > 0.1:
@@ -385,12 +402,7 @@ def _process_batch(batch_data):
             results.append((fen, score, best_move))
         except (chess.engine.EngineTerminatedError, Exception) as e:
             logger.warning(f"Worker process encountered error: {e}. Attempting engine restart...")
-            # Attempt to restart engine once on error
-            try:
-                if _worker_engine: _worker_engine.quit()
-            except Exception as e2:
-                logger.debug(f"Failed to quit worker engine during recovery: {e2}")
-            _worker_engine = None
+            _close_worker()
             if not ensure_engine(): break
             
             try:
@@ -429,8 +441,15 @@ class ParallelMiner:
             # Skip games if resuming
             if initial_games > 0:
                 logger.info(f"Skipping {initial_games} games...")
-                for _ in range(initial_games):
-                    chess.pgn.read_game(text_stream)
+                # Optimization: Reading lines might be faster than full PGN parsing just to skip
+                games_skipped = 0
+                while games_skipped < initial_games:
+                     # This is a rough skip, ideally we'd use a more robust parser or just consume games
+                     # Since python-chess read_game is slow, for massive skips this is a bottleneck.
+                     # But for correctness we use read_game.
+                     if chess.pgn.read_game(text_stream) is None:
+                         break
+                     games_skipped += 1
 
             with multiprocessing.Pool(
                 processes=self.num_workers,
@@ -509,7 +528,7 @@ class ParallelMiner:
 
                             if total_positions % 500 == 0:
                                 elapsed = time.time() - start_time
-                                pps = total_positions / elapsed
+                                pps = total_positions / max(elapsed, 0.001)
                                 total_processed = total_positions + duplicates_removed
                                 dedup_rate = (duplicates_removed / total_processed * 100) if total_processed > 0 else 0
                                 print(f"\r{MAGENTA}[*] Positions: {total_positions} | Dedup: {dedup_rate:.1f}% | Speed: {pps:.1f} pos/s{RESET}", end="", flush=True)
@@ -521,9 +540,6 @@ class ParallelMiner:
                     # Explicitly close workers
                     pool.close()
                     pool.join()
-                    # We can't easily call _close_worker in the pool from here,
-                    # but pool.join() should wait for processes to exit.
-                    # Usually workers exit when the pool is closed.
 
         logger.info("Mining phase completed.")
         return total_positions, games_processed
@@ -577,14 +593,25 @@ class StorageBackend:
             return
 
         count = len(self.buffer["fens"])
-        with h5py.File(self.output_file, "a") as f:
-            if count > 0:
-                for key in ["fens", "scores", "moves"]:
-                    dset = f[key]
-                    dset.resize(dset.shape[0] + count, axis=0)
-                    dset[-count:] = self.buffer[key]
-
-            f.attrs["games_processed"] = self.current_games_processed
+        try:
+            with h5py.File(self.output_file, "a") as f:
+                if count > 0:
+                    for key in ["fens", "scores", "moves"]:
+                        dset = f[key]
+                        dset.resize(dset.shape[0] + count, axis=0)
+                        dset[-count:] = self.buffer[key]
+                
+                f.attrs["games_processed"] = self.current_games_processed
+                f.flush() # Explicit flush
+        except Exception as e:
+            logger.critical(f"Failed to flush data to HDF5: {e}")
+            # Try to save buffer to a backup pickle in case of critical HDF5 failure
+            import pickle
+            backup_file = f"{self.output_file}.backup.{int(time.time())}.pkl"
+            with open(backup_file, 'wb') as bf:
+                pickle.dump(self.buffer, bf)
+            logger.critical(f"Emergency backup saved to {backup_file}")
+            raise
 
         self.buffer = {k: [] for k in self.buffer}
 
@@ -655,13 +682,14 @@ def main():
     print(f"\n{CYAN}{'='*60}\n               SUCCESS REPORT\n{'='*60}{RESET}")
     print(f"Total Time:     {total_time/3600:.2f} hours")
     print(f"Total Positions: {total_pos}")
-    print(f"Average Speed:   {total_pos/total_time:.1f} pos/s")
+    print(f"Average Speed:   {total_pos/max(total_time, 1):.1f} pos/s")
     print(f"Output File:     {args.output}")
     print(f"{CYAN}{'='*60}{RESET}\n")
 
 if __name__ == "__main__":
     # Windows fix for multiprocessing
     multiprocessing.freeze_support()
+    multiprocessing.set_start_method('spawn', force=True)
 
     # Self-healing first
     DependencyManager.heal()

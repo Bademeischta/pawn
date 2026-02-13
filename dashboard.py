@@ -50,9 +50,18 @@ class DashboardData:
 
     def _safe_query(self, query: str, params: tuple = ()) -> pd.DataFrame:
         """Execute a query safely and return a DataFrame."""
+        if not Path(self.db_path).exists():
+             return pd.DataFrame()
+
         try:
             with sqlite3.connect(self.db_path) as conn:
                 return pd.read_sql_query(query, conn, params=params)
+        except sqlite3.OperationalError as e:
+            # Handle "no such table" errors gracefully for fresh installs
+            if "no such table" in str(e):
+                return pd.DataFrame()
+            st.error(f"Database error: {e}")
+            return pd.DataFrame()
         except Exception as e:
             st.error(f"Database error: {e}")
             return pd.DataFrame()

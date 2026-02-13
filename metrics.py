@@ -64,6 +64,11 @@ class MetricsLogger:
     def _init_database(self):
         """Initialize all database tables."""
         conn = sqlite3.connect(str(self.db_path))
+        
+        # Enable WAL mode for better concurrency and performance
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        
         cursor = conn.cursor()
         
         # Training & Neural Network Metrics

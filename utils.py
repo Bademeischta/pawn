@@ -1,6 +1,9 @@
 import torch
 import logging
 import logging.config
+import os
+from pathlib import Path
+from typing import Union, Any
 
 def setup_logging(level=logging.INFO):
     """Set up centralized logging configuration."""
@@ -40,8 +43,9 @@ def setup_logging(level=logging.INFO):
     logging.config.dictConfig(LOG_CONFIG)
 
 
-def safe_load_checkpoint(path, device):
+def safe_load_checkpoint(path: Union[str, Path], device: torch.device):
     """Load checkpoint with security and backwards compatibility."""
+    path = str(path)
     try:
         # PyTorch 2.4+: Secure loading
         return torch.load(path, map_location=device, weights_only=True)
@@ -56,14 +60,11 @@ def safe_load_checkpoint(path, device):
         return torch.load(path, map_location=device)
 
 
-def safe_save(obj, path):
+def safe_save(obj: Any, path: Union[str, Path]):
     """
     Save an object to a path safely using a temporary file.
     Prevents corruption if the process is interrupted during write.
     """
-    from pathlib import Path
-    import os
-
     path = Path(path)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
 
@@ -71,8 +72,13 @@ def safe_save(obj, path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Save to temporary file
-    import torch
     torch.save(obj, str(tmp_path))
 
-    # Atomic rename (on POSIX)
-    os.replace(tmp_path, path)
+    # Atomic rename (Atomic on POSIX, atomic on Windows 3.3+ if target exists)
+    try:
+        os.replace(tmp_path, path)
+    except OSError:
+        # Fallback for older Windows or file lock issues
+        if path.exists():
+            path.unlink()
+        os.rename(tmp_path, path)

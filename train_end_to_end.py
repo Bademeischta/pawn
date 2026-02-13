@@ -239,11 +239,14 @@ class SelfPlayGenerator:
             positions.append([fen, policy_target, 0.0, board.turn])
 
             # If opponent engine is provided, it can override MCTS for its turn
-            # but we still recorded our MCTS policy for that position if we wanted to learn it.
-            # Actually, better to only learn from MCTS if it's the one playing.
             if opponent_engine and board.turn == chess.BLACK:
-                result = opponent_engine.play(board, chess.engine.Limit(time=0.01))
-                move = result.move
+                try:
+                    result = opponent_engine.play(board, chess.engine.Limit(time=0.01))
+                    move = result.move
+                except Exception as e:
+                    logger.error(f"Opponent engine error: {e}")
+                    # Fallback to MCTS move if engine fails
+                    pass
 
             board.push(move)
             move_count += 1
@@ -258,6 +261,9 @@ class SelfPlayGenerator:
         for fen, policy, _, turn in positions:
             v = final_v if turn == chess.WHITE else -final_v
             processed.append((fen, policy, v))
+
+        # Explicitly clear MCTS memory after game to prevent OOM
+        self.mcts.clear_memory()
 
         return processed
 
@@ -279,10 +285,16 @@ class OpponentScheduler:
         return 10
 
     def get_engine(self, epoch: int):
-        level = self.get_level(epoch)
-        engine = chess.engine.SimpleEngine.popen_uci(self.sf_path)
-        engine.configure({"Skill Level": level})
-        return engine
+        try:
+            level = self.get_level(epoch)
+            if not Path(self.sf_path).exists():
+                return None
+            engine = chess.engine.SimpleEngine.popen_uci(self.sf_path)
+            engine.configure({"Skill Level": level})
+            return engine
+        except Exception as e:
+            logger.error(f"Failed to start opponent engine: {e}")
+            return None
 
 
 class Trainer:
@@ -300,6 +312,7 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler()
         self.metrics_logger = MetricsLogger(db_path=db_path)
         
+        # L2 Regularization enabled via weight_decay
         self.optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
 
@@ -316,10 +329,11 @@ class Trainer:
         kl_loss = F.kl_div(soft_logits, soft_targets, reduction='batchmean')
         ce_loss = F.cross_entropy(logits, targets.argmax(dim=1))
         
-        policy_loss = 0.7 * kl_loss * (temperature ** 2) + 0.3 * ce_loss
+        # Balanced Loss Weights: 1.0 Policy + 1.0 Value
+        policy_loss = 1.0 * kl_loss * (temperature ** 2) + 1.0 * ce_loss
         value_loss = F.mse_loss(value_pred, value_targets)
         
-        return 0.7 * policy_loss + 0.3 * value_loss, policy_loss, value_loss
+        return 1.0 * policy_loss + 1.0 * value_loss, policy_loss, value_loss
 
     def train_epoch(self, dataloader: DataLoader, dataset: Optional[Dataset], epoch: int, temperature: float = 2.0) -> Tuple[float, float]:
         self.model.train()
@@ -406,41 +420,51 @@ class Trainer:
             return 0.0
 
         # Basic security check: ensure it's an executable file
-        if not os.access(sf_path_obj, os.X_OK):
+        # Skip on Windows as os.X_OK is not fully reliable/relevant for .exe in same way
+        if os.name != 'nt' and not os.access(sf_path_obj, os.X_OK):
             logger.error(f"Stockfish path {sf_path} is not executable")
             return 0.0
 
         from mcts import MCTS
         mcts = MCTS(self.model, AlphaZeroEncoder(), num_simulations=400)
-        engine = chess.engine.SimpleEngine.popen_uci(sf_path)
-        engine.configure({"Skill Level": 10})
+        
+        engine = None
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+            engine.configure({"Skill Level": 10})
 
-        wins = 0
-        draws = 0
+            wins = 0
+            draws = 0
 
-        for i in range(num_games):
-            board = chess.Board()
-            # Randomize playing color
-            model_color = chess.WHITE if i % 2 == 0 else chess.BLACK
+            for i in range(num_games):
+                board = chess.Board()
+                # Randomize playing color
+                model_color = chess.WHITE if i % 2 == 0 else chess.BLACK
 
-            while not board.is_game_over():
-                if board.turn == model_color:
-                    move, _ = mcts.search(board, add_noise=False)
-                else:
-                    result = engine.play(board, chess.engine.Limit(time=0.05))
-                    move = result.move
-                board.push(move)
+                while not board.is_game_over():
+                    if board.turn == model_color:
+                        move, _ = mcts.search(board, add_noise=False)
+                    else:
+                        result = engine.play(board, chess.engine.Limit(time=0.05))
+                        move = result.move
+                    board.push(move)
 
-            res = board.result()
-            if (res == "1-0" and model_color == chess.WHITE) or (res == "0-1" and model_color == chess.BLACK):
-                wins += 1
-            elif res == "1/2-1/2":
-                draws += 1
+                res = board.result()
+                if (res == "1-0" and model_color == chess.WHITE) or (res == "0-1" and model_color == chess.BLACK):
+                    wins += 1
+                elif res == "1/2-1/2":
+                    draws += 1
+            
+            win_rate = (wins + 0.5 * draws) / num_games
+            logger.info(f"Evaluation against Stockfish: Win Rate = {win_rate:.2%}")
+            return win_rate
 
-        engine.quit()
-        win_rate = (wins + 0.5 * draws) / num_games
-        logger.info(f"Evaluation against Stockfish: Win Rate = {win_rate:.2%}")
-        return win_rate
+        except Exception as e:
+            logger.error(f"Error during evaluation: {e}")
+            return 0.0
+        finally:
+            if engine:
+                engine.quit()
 
     def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10, initial_replay_buffer=None):
         # Phase 1: Supervised Distillation
@@ -451,7 +475,7 @@ class Trainer:
             for epoch in range(start_ep, 50):
                 self.current_epoch = epoch
                 sampler = supervised_dataset.get_sampler()
-                loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
+                loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=0) # num_workers=0 for safety on Windows
                 
                 temp = max(0.5, 2.0 - (epoch / 50) * 1.5)
                 loss, acc = self.train_epoch(loader, supervised_dataset, epoch, temperature=temp)
@@ -489,19 +513,24 @@ class Trainer:
         start_ep_rl = max(self.current_epoch + 1, 51)
         for epoch in range(start_ep_rl, num_epochs):
             self.current_epoch = epoch
-            engine = scheduler.get_engine(epoch) if scheduler else None
             
-            # 1. Data Generation
-            logger.info(f"Generating self-play games for epoch {epoch}...")
-            for _ in tqdm(range(games_per_epoch), desc="Games"):
-                game_data = generator.generate_game(opponent_engine=engine)
-                for fen, policy, value in game_data:
-                    replay_buffer.add(fen, policy, value)
-            if engine: engine.quit()
+            engine = None
+            try:
+                engine = scheduler.get_engine(epoch) if scheduler else None
+                
+                # 1. Data Generation
+                logger.info(f"Generating self-play games for epoch {epoch}...")
+                for _ in tqdm(range(games_per_epoch), desc="Games"):
+                    game_data = generator.generate_game(opponent_engine=engine)
+                    for fen, policy, value in game_data:
+                        replay_buffer.add(fen, policy, value)
+            finally:
+                if engine:
+                    engine.quit()
             
             # 2. Training
             combined_dataset = CombinedDataset(supervised_dataset, replay_buffer)
-            loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
+            loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
             
             loss, acc = self.train_epoch(loader, combined_dataset, epoch, temperature=0.5) # Sharpened T in RL
             
@@ -519,7 +548,7 @@ def main():
     setup_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--h5", type=str, default="distillzero_dataset.h5", help="Path to Stockfish HDF5 dataset")
-    parser.add_argument("--sf", type=str, default="assets/stockfish", help="Path to Stockfish binary")
+    parser.add_argument("--sf", type=str, default="assets/stockfish.exe", help="Path to Stockfish binary")
     parser.add_argument("--epochs", type=int, default=100, help="Total number of epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")

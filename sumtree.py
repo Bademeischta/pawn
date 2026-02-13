@@ -12,12 +12,20 @@ class SumTree:
         self.tree = np.zeros(2 * capacity - 1)
         self.data_pointer = 0
         self.count = 0
+        self._max_priority = 1.0  # Initialize with 1.0 to avoid zero priority issues
 
     def update(self, data_idx: int, priority: float):
         """Update priority at a given data index."""
+        # Validate index
+        if data_idx < 0 or data_idx >= self.capacity:
+            raise IndexError(f"Data index {data_idx} out of range [0, {self.capacity-1}]")
+
         tree_idx = data_idx + self.capacity - 1
         change = priority - self.tree[tree_idx]
         self.tree[tree_idx] = priority
+        
+        # Track max priority efficiently
+        self._max_priority = max(self._max_priority, priority)
 
         # Propagate the change up the tree
         while tree_idx != 0:
@@ -52,6 +60,11 @@ class SumTree:
     def total_priority(self):
         """Return the sum of all priorities."""
         return self.tree[0]
+
+    @property
+    def max_priority(self):
+        """Return the maximum priority recorded."""
+        return self._max_priority
 
     def add(self, priority: float):
         """Add a new priority (incremental update)."""
