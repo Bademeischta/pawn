@@ -27,46 +27,40 @@ param (
 
 $ErrorActionPreference = "Stop"
 
-# --- Colors for Output ---
-function Write-Success { param($Message) Write-Host "✔ $Message" -ForegroundColor Green }
-function Write-Info    { param($Message) Write-Host "ℹ $Message" -ForegroundColor Cyan }
-function Write-Warn    { param($Message) Write-Host "⚠ $Message" -ForegroundColor Yellow }
-function Write-ErrorMsg   { param($Message) Write-Host "✖ $Message" -ForegroundColor Red }
-
 Write-Host "==================================================" -ForegroundColor Magenta
 Write-Host "   PAWN CHESS AI - WINDOWS LAUNCHER               " -ForegroundColor Magenta
 Write-Host "==================================================" -ForegroundColor Magenta
 Write-Host ""
 
 # 1. Python Detection
-Write-Info "Checking Python installation..."
+Write-Host "ℹ Checking Python installation..." -ForegroundColor Cyan
 try {
     $pyVersion = python --version 2>&1
     if ($pyVersion -match "Python 3\.(8|9|10|11|12)") {
-        Write-Success "Found $pyVersion"
+        Write-Host "✔ Found $pyVersion" -ForegroundColor Green
     } else {
         throw "Python 3.8+ is required but not found in PATH. Please install it from python.org."
     }
 } catch {
-    Write-ErrorMsg "Python detection failed: $_"
+    Write-Host "✖ Python detection failed: $_" -ForegroundColor Red
     exit 1
 }
 
 # 2. Virtual Environment Setup
 $VenvPath = Join-Path $PSScriptRoot "venv"
 if (-not (Test-Path $VenvPath)) {
-    Write-Info "Creating virtual environment at $VenvPath..."
+    Write-Host "ℹ Creating virtual environment at $VenvPath..." -ForegroundColor Cyan
     python -m venv $VenvPath
     if ($LASTEXITCODE -ne 0) { throw "Failed to create venv." }
-    Write-Success "Virtual environment created."
+    Write-Host "✔ Virtual environment created." -ForegroundColor Green
 } else {
-    Write-Info "Virtual environment already exists."
+    Write-Host "ℹ Virtual environment already exists." -ForegroundColor Cyan
 }
 
 # Activate Venv
 $ActivateScript = Join-Path $VenvPath "Scripts\activate.ps1"
 if (-not (Test-Path $ActivateScript)) {
-    Write-ErrorMsg "Activation script not found at $ActivateScript. The venv might be corrupted."
+    Write-Host "✖ Activation script not found at $ActivateScript. The venv might be corrupted." -ForegroundColor Red
     exit 1
 }
 
@@ -76,28 +70,28 @@ $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $VenvPip = Join-Path $VenvPath "Scripts\pip.exe"
 $VenvStreamlit = Join-Path $VenvPath "Scripts\streamlit.exe"
 
-Write-Success "Using Python at: $VenvPython"
+Write-Host "✔ Using Python at: $VenvPython" -ForegroundColor Green
 
 # 3. Dependencies
-Write-Info "Installing/Updating dependencies..."
+Write-Host "ℹ Installing/Updating dependencies..." -ForegroundColor Cyan
 try {
     & $VenvPip install --upgrade pip setuptools wheel | Out-Null
     & $VenvPip install -r requirements.txt
     if ($LASTEXITCODE -ne 0) { throw "Pip install failed." }
-    Write-Success "Dependencies installed."
+    Write-Host "✔ Dependencies installed." -ForegroundColor Green
 } catch {
-    Write-ErrorMsg "Failed to install dependencies: $_"
+    Write-Host "✖ Failed to install dependencies: $_" -ForegroundColor Red
     exit 1
 }
 
 # 4. Directory Structure
-Write-Info "Verifying directory structure..."
+Write-Host "ℹ Verifying directory structure..." -ForegroundColor Cyan
 $Dirs = @("logs", "checkpoints", "data", "assets")
 foreach ($d in $Dirs) {
     $p = Join-Path $PSScriptRoot $d
     if (-not (Test-Path $p)) {
         New-Item -ItemType Directory -Path $p | Out-Null
-        Write-Success "Created directory: $d"
+        Write-Host "✔ Created directory: $d" -ForegroundColor Green
     }
 }
 
@@ -109,10 +103,10 @@ if (-not (Test-Path $AbsStockfishPath)) {
 }
 
 if (-not (Test-Path $AbsStockfishPath)) {
-    Write-Warn "Stockfish executable not found at: $StockfishPath"
-    Write-Warn "The system will attempt to download it automatically via distillzero_factory.py later."
+    Write-Host "⚠ Stockfish executable not found at: $StockfishPath" -ForegroundColor Yellow
+    Write-Host "⚠ The system will attempt to download it automatically via distillzero_factory.py later." -ForegroundColor Yellow
 } else {
-    Write-Success "Stockfish found at: $AbsStockfishPath"
+    Write-Host "✔ Stockfish found at: $AbsStockfishPath" -ForegroundColor Green
 }
 
 # 6. Launch
@@ -122,22 +116,22 @@ Write-Host "   SYSTEM READY - STARTING SERVICES               " -ForegroundColor
 Write-Host "==================================================" -ForegroundColor Magenta
 Write-Host ""
 
-Write-Info "Starting Dashboard..."
+Write-Host "ℹ Starting Dashboard..." -ForegroundColor Cyan
 
 # Check if dashboard.py exists
 if (-not (Test-Path "dashboard.py")) {
-    Write-ErrorMsg "dashboard.py not found!"
+    Write-Host "✖ dashboard.py not found!" -ForegroundColor Red
     exit 1
 }
 
 # Launch Streamlit
 try {
     Start-Process -FilePath $VenvStreamlit -ArgumentList "run dashboard.py" -NoNewWindow
-    Write-Success "Dashboard launched."
+    Write-Host "✔ Dashboard launched." -ForegroundColor Green
 } catch {
-    Write-ErrorMsg "Failed to launch dashboard: $_"
+    Write-Host "✖ Failed to launch dashboard: $_" -ForegroundColor Red
 }
 
 Write-Host ""
-Write-Success "Setup Complete. You can now run training scripts manually using:"
+Write-Host "✔ Setup Complete. You can now run training scripts manually using:" -ForegroundColor Green
 Write-Host "  & '$VenvPython' train_end_to_end.py" -ForegroundColor Cyan
