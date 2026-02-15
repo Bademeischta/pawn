@@ -309,7 +309,8 @@ class Trainer:
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
-        self.scaler = torch.cuda.amp.GradScaler()
+        device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        self.scaler = torch.amp.GradScaler(device_type, enabled=(self.device.type == "cuda"))
         self.metrics_logger = MetricsLogger(db_path=db_path)
         
         # L2 Regularization enabled via weight_decay
@@ -345,7 +346,7 @@ class Trainer:
             images, policy_targets, value_targets = images.to(self.device), policy_targets.to(self.device), value_targets.to(self.device)
             
             self.optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
                 logits, value_pred = self.model(images)
                 loss, p_loss, v_loss = self.distillation_loss(logits, policy_targets, value_pred, value_targets, temperature)
             
@@ -388,7 +389,7 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
         }
         if replay_buffer is not None:
-            data['replay_buffer'] = replay_buffer
+            data['replay_buffer'] = getattr(replay_buffer, "buffer", replay_buffer)
 
         safe_save(data, checkpoint_path)
 
@@ -466,18 +467,19 @@ class Trainer:
             if engine:
                 engine.quit()
 
-    def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10, initial_replay_buffer=None):
+    def train(self, h5_path, sf_path, num_epochs=100, batch_size=64, games_per_epoch=10, initial_replay_buffer=None, supervised_epochs: int = 50, supervised_early_stop_acc: Optional[float] = None):
         # Phase 1: Supervised Distillation
         logger.info("--- PHASE 1: Supervised Distillation ---")
         supervised_dataset = StockfishDataset(h5_path, min_eval=0.7)
-        if len(supervised_dataset) > 0 and self.current_epoch < 50:
+        supervised_epochs = max(0, min(int(supervised_epochs), int(num_epochs)))
+        if len(supervised_dataset) > 0 and self.current_epoch < supervised_epochs:
             start_ep = self.current_epoch
-            for epoch in range(start_ep, 50):
+            for epoch in range(start_ep, supervised_epochs):
                 self.current_epoch = epoch
                 sampler = supervised_dataset.get_sampler()
                 loader = DataLoader(supervised_dataset, batch_size=batch_size, sampler=sampler, num_workers=0) # num_workers=0 for safety on Windows
                 
-                temp = max(0.5, 2.0 - (epoch / 50) * 1.5)
+                temp = max(0.5, 2.0 - (epoch / max(1, supervised_epochs)) * 1.5)
                 loss, acc = self.train_epoch(loader, supervised_dataset, epoch, temperature=temp)
                 self.save_checkpoint("latest")
 
@@ -485,7 +487,7 @@ class Trainer:
                 if supervised_dataset.unmapped_moves:
                     logger.warning(f"Unmapped moves in epoch {epoch}: {len(supervised_dataset.unmapped_moves)}")
 
-                if acc > 0.55:
+                if supervised_early_stop_acc is not None and acc > supervised_early_stop_acc:
                     logger.info(f"Target accuracy {acc:.2%} reached. Ending Supervised Phase.")
                     break
         
@@ -510,13 +512,14 @@ class Trainer:
             elif isinstance(initial_replay_buffer, ReplayBuffer):
                 replay_buffer = initial_replay_buffer
         
-        start_ep_rl = max(self.current_epoch + 1, 51)
+        start_ep_rl = self.current_epoch + 1
         for epoch in range(start_ep_rl, num_epochs):
             self.current_epoch = epoch
             
             engine = None
             try:
-                engine = scheduler.get_engine(epoch) if scheduler else None
+                rl_epoch = epoch - start_ep_rl
+                engine = scheduler.get_engine(rl_epoch) if scheduler else None
                 
                 # 1. Data Generation
                 logger.info(f"Generating self-play games for epoch {epoch}...")
@@ -550,6 +553,8 @@ def main():
     parser.add_argument("--h5", type=str, default="distillzero_dataset.h5", help="Path to Stockfish HDF5 dataset")
     parser.add_argument("--sf", type=str, default="assets/stockfish.exe", help="Path to Stockfish binary")
     parser.add_argument("--epochs", type=int, default=100, help="Total number of epochs")
+    parser.add_argument("--supervised-epochs", type=int, default=50, help="Max supervised epochs (Phase 1)")
+    parser.add_argument("--supervised-early-stop-acc", type=float, default=None, help="End Phase 1 early if acc exceeds this (omit to disable)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
@@ -574,7 +579,9 @@ def main():
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         games_per_epoch=args.games_per_epoch,
-        initial_replay_buffer=replay_buffer
+        initial_replay_buffer=replay_buffer,
+        supervised_epochs=args.supervised_epochs,
+        supervised_early_stop_acc=args.supervised_early_stop_acc
     )
 
 if __name__ == "__main__":

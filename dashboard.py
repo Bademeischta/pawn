@@ -3,6 +3,7 @@ Archimedes Chess AI - Interactive Dashboard
 Streamlit-based dashboard with live metrics, visualization, and play vs AI.
 """
 
+
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -98,7 +99,7 @@ class DashboardData:
 
 
 @st.cache_resource
-def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
+def load_model(checkpoint_path: str = "checkpoints/latest.pt"):
     """Load the trained model."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -118,6 +119,28 @@ def load_model(checkpoint_path: str = "checkpoints/latest_checkpoint.pt"):
     except Exception as e:
         st.error(f"Error loading model: {e}")
         return None, None, device
+
+
+def resolve_checkpoint_path(requested_path: str) -> str:
+    requested = Path(requested_path)
+    if requested.exists():
+        return str(requested)
+
+    checkpoints_dir = Path("./checkpoints").resolve()
+    preferred = [
+        checkpoints_dir / "latest.pt",
+        checkpoints_dir / "latest_checkpoint.pt",
+    ]
+    for p in preferred:
+        if p.exists():
+            return str(p)
+
+    candidates = list(checkpoints_dir.glob("*.pt")) + list(checkpoints_dir.glob("*.pth"))
+    if not candidates:
+        return requested_path
+
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return str(newest)
 
 
 def render_board_svg(board: chess.Board, size: int = 400) -> str:
@@ -542,7 +565,7 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", type=str, default="logs/training_logs.db", help="Path to SQLite metrics database")
-    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/latest_checkpoint.pt", help="Path to model checkpoint")
+    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/latest.pt", help="Path to model checkpoint")
 
     # Handle streamlit-specific argument passing
     try:
@@ -551,7 +574,7 @@ def main():
         # Fallback if argparse fails within streamlit
         class Args:
             db_path = "logs/training_logs.db"
-            checkpoint_path = "checkpoints/latest_checkpoint.pt"
+            checkpoint_path = "checkpoints/latest.pt"
         args = Args()
     
     # Title
@@ -568,6 +591,7 @@ def main():
         try:
             db_path = str(SafePathValidator.validate_and_get_path(db_path_raw))
             checkpoint_path = str(SafePathValidator.validate_and_get_path(checkpoint_path_raw))
+            checkpoint_path = resolve_checkpoint_path(checkpoint_path)
 
             # Show file status
             if not Path(db_path).exists():

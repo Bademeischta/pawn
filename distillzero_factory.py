@@ -380,7 +380,7 @@ def _process_batch(batch_data):
         return _worker_engine is not None
 
     if not ensure_engine():
-        return []
+        return [], batch_max_game_idx
 
     for fen in fens:
         try:

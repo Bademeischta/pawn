@@ -257,6 +257,7 @@ class MCTS:
         paths = []
         leaf_boards = []
         leaf_nodes = []
+        leaf_values: List[Optional[float]] = []
 
         # 1. Selection
         for _ in range(batch_size):
@@ -279,6 +280,8 @@ class MCTS:
             leaf_boards.append(current_board)
             leaf_nodes.append(current_node)
             self.metrics.record_node(depth, current_node.q_value(), current_node.visit_count, len(current_node.children))
+
+        leaf_values = [None] * len(leaf_nodes)
 
         # 2. Evaluation
         eval_indices = [i for i, node in enumerate(leaf_nodes) if not node.is_terminal]
@@ -320,7 +323,7 @@ class MCTS:
                         elif result == "0-1": val = -1.0 if board_at_leaf.turn == chess.WHITE else 1.0
                         else: val = 0.0
                         node.terminal_value = val
-                        node.total_value = val # Propagate terminal value immediately
+                        leaf_values[idx] = val
                     else:
                         for move in legal_moves:
                             move_idx = move_encoder.move_to_index(move)
@@ -338,20 +341,24 @@ class MCTS:
                         if total_prior > 0:
                             for child in node.children.values():
                                 child.prior_prob /= total_prior
-
-                        node.visit_count = 1
-                        node.total_value = value
+                        leaf_values[idx] = float(value)
                 
                 self.metrics.positions_evaluated += 1
 
         # 3. Backpropagation
         for i, path in enumerate(paths):
             leaf_node = leaf_nodes[i]
-            with leaf_node._lock:
-                if leaf_node.is_terminal:
-                    value = leaf_node.terminal_value
-                else:
-                    value = leaf_node.total_value / max(1, leaf_node.visit_count)
+            value = leaf_values[i]
+            if value is None:
+                with leaf_node._lock:
+                    if leaf_node.is_terminal:
+                        value = leaf_node.terminal_value
+                    else:
+                        value = leaf_node.total_value / max(1, leaf_node.visit_count)
+
+            # Update leaf node itself (it is not included in `path`)
+            # Virtual loss was applied only to nodes in `path`, not to leaf_node.
+            leaf_node.update_stats(delta_visit=1, delta_value=value, delta_vloss=0)
 
             current_value = -value
             for node in reversed(path):
@@ -392,21 +399,51 @@ class MCTS:
             return best_move, best_child
     
     def _select_move(self, root: MCTSNode, board: chess.Board) -> chess.Move:
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            raise ValueError("No legal moves available for move selection.")
+
         if not root.children:
-            return np.random.choice(list(board.legal_moves))
-        
-        moves = list(root.children.keys())
-        visit_counts = np.array([root.children[m].visit_count for m in moves])
-        
-        if self.temperature == 0:
-            best_idx = np.argmax(visit_counts)
-            return moves[best_idx]
-        else:
-            # Safe exponentiation
-            visit_counts = visit_counts.astype(np.float64)
-            visit_counts = visit_counts ** (1.0 / self.temperature)
-            probs = visit_counts / (visit_counts.sum() + 1e-8)
+            return np.random.choice(legal_moves)
+
+        legal_set = set(legal_moves)
+        moves = [m for m in root.children.keys() if m in legal_set]
+        if not moves:
+            return np.random.choice(legal_moves)
+
+        visit_counts = np.array([root.children[m].visit_count for m in moves], dtype=np.float64)
+        visit_counts[~np.isfinite(visit_counts)] = 0.0
+        visit_counts[visit_counts < 0] = 0.0
+
+        if self.temperature <= 0:
+            return moves[int(np.argmax(visit_counts))]
+
+        total_visits = float(visit_counts.sum())
+        if total_visits <= 0.0:
+            priors = np.array([root.children[m].prior_prob for m in moves], dtype=np.float64)
+            priors[~np.isfinite(priors)] = 0.0
+            priors[priors < 0] = 0.0
+            prior_sum = float(priors.sum())
+            if prior_sum > 0.0:
+                probs = priors / prior_sum
+            else:
+                probs = np.full(len(moves), 1.0 / len(moves), dtype=np.float64)
+            probs = probs / probs.sum()
             return np.random.choice(moves, p=probs)
+
+        # Temperature scaling (stable): use log(count+eps) then softmax
+        eps = 1e-8
+        logits = np.log(visit_counts + eps) / float(self.temperature)
+        logits = logits - np.max(logits)
+        exp_logits = np.exp(logits)
+        exp_logits[~np.isfinite(exp_logits)] = 0.0
+        s = float(exp_logits.sum())
+        if s <= 0.0:
+            probs = np.full(len(moves), 1.0 / len(moves), dtype=np.float64)
+        else:
+            probs = exp_logits / s
+            probs = probs / probs.sum()
+        return np.random.choice(moves, p=probs)
     
     def _get_or_create_node(self, board: chess.Board, board_hash: str, 
                            parent: Optional[MCTSNode], move: Optional[chess.Move]) -> MCTSNode:

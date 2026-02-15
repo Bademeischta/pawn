@@ -58,6 +58,20 @@ def safe_load_checkpoint(path: Union[str, Path], device: torch.device):
             UserWarning
         )
         return torch.load(path, map_location=device)
+    except Exception as e:
+        msg = str(e)
+        if "Weights only load failed" in msg or "WeightsUnpickler error" in msg or "Unsupported global" in msg:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Secure weights-only load failed for %s; retrying with weights_only=False. "
+                "Only do this for checkpoints from a trusted source.",
+                path
+            )
+            try:
+                return torch.load(path, map_location=device, weights_only=False)
+            except TypeError:
+                return torch.load(path, map_location=device)
+        raise
 
 
 def safe_save(obj: Any, path: Union[str, Path]):
