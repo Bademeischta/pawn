@@ -343,16 +343,32 @@ class Trainer:
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         for indices, images, policy_targets, value_targets in dataloader:
-            images, policy_targets, value_targets = images.to(self.device), policy_targets.to(self.device), value_targets.to(self.device)
-            
-            self.optimizer.zero_grad()
-            with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
-                logits, value_pred = self.model(images)
-                loss, p_loss, v_loss = self.distillation_loss(logits, policy_targets, value_pred, value_targets, temperature)
-            
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            try:
+                images, policy_targets, value_targets = images.to(self.device), policy_targets.to(self.device), value_targets.to(self.device)
+                
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
+                    logits, value_pred = self.model(images)
+                    loss, p_loss, v_loss = self.distillation_loss(logits, policy_targets, value_pred, value_targets, temperature)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if "out of memory" in msg or "memory allocation failure" in msg or "cuda error" in msg:
+                    logger.error(f"Training step failed (likely CUDA OOM/allocator issue): {e}")
+                    try:
+                        self.optimizer.zero_grad(set_to_none=True)
+                    except Exception:
+                        pass
+                    if self.device.type == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    continue
+                raise
             
             # Calculate TD-Error for priorities (only if dataset supports it)
             if dataset is not None:
@@ -371,32 +387,63 @@ class Trainer:
 
     def save_checkpoint(self, name, replay_buffer=None):
         checkpoint_path = self.checkpoint_dir / f"{name}.pt"
+        model_only_path = self.checkpoint_dir / f"{name}_model.pt"
 
-        # Post-save validation: Check for NaN/Inf in weights
+        try:
+            model_state_cpu = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+        except Exception as e:
+            logger.error(f"Failed to materialize model state_dict on CPU: {e}")
+            return False
+
         valid = True
-        for p in self.model.parameters():
-            if torch.isnan(p).any() or torch.isinf(p).any():
+        for t in model_state_cpu.values():
+            if not torch.isfinite(t).all():
                 logger.warning(f"NaN/Inf detected in model weights. Checkpoint {name} may be corrupted.")
                 valid = False
                 break
 
-        if not valid: return False
+        if not valid:
+            return False
+
+        try:
+            safe_save({'epoch': self.current_epoch, 'model_state_dict': model_state_cpu}, model_only_path)
+            if name == "latest":
+                safe_save({'epoch': self.current_epoch, 'model_state_dict': model_state_cpu}, self.checkpoint_dir / "latest_model.pt")
+        except Exception as e:
+            logger.error(f"Failed to save model-only checkpoint {model_only_path}: {e}")
 
         data = {
             'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_cpu,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
         }
         if replay_buffer is not None:
             data['replay_buffer'] = getattr(replay_buffer, "buffer", replay_buffer)
 
-        safe_save(data, checkpoint_path)
+        try:
+            optimizer_state = data.get('optimizer_state_dict') or {}
+            for state in optimizer_state.get('state', {}).values():
+                for k, v in list(state.items()):
+                    if torch.is_tensor(v):
+                        state[k] = v.detach().cpu()
+            data['optimizer_state_dict'] = optimizer_state
+        except Exception as e:
+            logger.warning(f"Failed to convert optimizer state to CPU for checkpoint {name}: {e}")
+
+        try:
+            safe_save(data, checkpoint_path)
+        except Exception as e:
+            logger.error(f"Failed to save full checkpoint {checkpoint_path}: {e}")
+            return False
 
         # Also keep a 'latest.pt' for easy resume
         if name != "latest":
             latest_path = self.checkpoint_dir / "latest.pt"
-            safe_save(data, latest_path)
+            try:
+                safe_save(data, latest_path)
+            except Exception as e:
+                logger.error(f"Failed to save latest checkpoint {latest_path}: {e}")
 
         return True
 
@@ -555,15 +602,21 @@ def main():
     parser.add_argument("--epochs", type=int, default=100, help="Total number of epochs")
     parser.add_argument("--supervised-epochs", type=int, default=50, help="Max supervised epochs (Phase 1)")
     parser.add_argument("--supervised-early-stop-acc", type=float, default=None, help="End Phase 1 early if acc exceeds this (omit to disable)")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device selection")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--db-path", type=str, default="logs/training_logs.db", help="Path to SQLite metrics database")
     parser.add_argument("--games-per-epoch", type=int, default=10, help="Self-play games per epoch in Phase 2")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     args = parser.parse_args()
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ChessResNet()
     
     trainer = Trainer(model, device, checkpoint_dir=args.checkpoint_dir, db_path=args.db_path)

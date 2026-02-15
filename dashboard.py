@@ -33,6 +33,15 @@ from utils import safe_load_checkpoint, setup_logging
 
 logger = logging.getLogger(__name__)
 
+class ReplayBuffer:
+    def __init__(self, *args, **kwargs):
+        pass
+
+try:
+    sys.modules.get("__main__").ReplayBuffer = ReplayBuffer
+except Exception:
+    pass
+
 
 # Page configuration
 st.set_page_config(
@@ -128,6 +137,7 @@ def resolve_checkpoint_path(requested_path: str) -> str:
 
     checkpoints_dir = Path("./checkpoints").resolve()
     preferred = [
+        checkpoints_dir / "latest_model.pt",
         checkpoints_dir / "latest.pt",
         checkpoints_dir / "latest_checkpoint.pt",
     ]
